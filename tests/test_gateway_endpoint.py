@@ -334,3 +334,16 @@ def test_gateway_ps1_resolution_order():
         "$Port = Get-ProfilePort $Profile",
     )]
     assert positions == sorted(positions)
+
+
+def test_gateway_ps1_start_does_not_force_port_takeover():
+    """Windows 正常启动不得走 OpenClaw ``--force`` 端口抢占路径。"""
+    text = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+    command_line = next(
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith('$command = "openclaw ')
+    )
+
+    assert "--force" not in command_line
+    assert "gateway run --allow-unconfigured --bind loopback" in command_line
