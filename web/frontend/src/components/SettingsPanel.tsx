@@ -5,8 +5,9 @@ import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
   fetchModelChannels, runChannelSelftest, saveModelConfig,
+  fetchLocalAgents, enableLocalAgent, fetchAvailableModels,
 } from '../lib/api';
-import type { EnvTool, ModelRow, SelftestResult } from '../lib/api';
+import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo } from '../lib/api';
 import { IconSlidersHorizontal, IconPackage, IconEllipsis } from './settingsIcons';
 
 interface Props { onClose: () => void; }
@@ -151,6 +152,48 @@ export default function SettingsPanel({ onClose }: Props) {
   const [selftest, setSelftest] = useState<{ testedAt: number; byBase: Record<string, SelftestResult> } | null>(null);
   const [testing, setTesting] = useState(false);
   const [selftestNote, setSelftestNote] = useState('');
+  // 本机 agent CLI（Claude Code / Gemini CLI…）：装了并登录过就免 API key
+  const [localAgents, setLocalAgents] = useState<LocalAgentInfo[]>([]);
+  const [localAgentsErr, setLocalAgentsErr] = useState('');
+  const [enabling, setEnabling] = useState('');
+  // 每个本机 agent 行上选中的模型（'' = 用该家默认）。
+  const [laModels, setLaModels] = useState<Record<string, string>>({});
+  const [localAgentNote, setLocalAgentNote] = useState('');
+
+  // 拉取模型列表：{ 行号 → { loading, models, err } }
+  const [modelLists, setModelLists] = useState<Record<number, { loading: boolean; models: string[]; err: string }>>({});
+
+  useEffect(() => {
+    let alive = true;
+    fetchWithRetry(() => fetchLocalAgents(), 3, 10000)
+      .then((d) => { if (alive) setLocalAgents(d.agents || []); })
+      .catch((e) => { if (alive) setLocalAgentsErr(e instanceof Error ? e.message : '探测失败'); });
+    return () => { alive = false; };
+  }, []);
+
+  const doEnableAgent = useCallback(async (id: string, model = '') => {
+    setEnabling(id);
+    setLocalAgentNote('');
+    try {
+      const d = await enableLocalAgent(id, model);
+      setLocalAgentNote(d.note || '已接入');
+      setLocalAgents((as) => as.map((a) => (a.id === id ? { ...a, configured: true } : a)));
+    } catch (e) {
+      setLocalAgentNote(e instanceof Error ? e.message : '接入失败');
+    } finally {
+      setEnabling('');
+    }
+  }, []);
+
+  const pullModels = useCallback(async (i: number, r: ModelRow) => {
+    setModelLists((m) => ({ ...m, [i]: { loading: true, models: m[i]?.models || [], err: '' } }));
+    try {
+      const d = await fetchAvailableModels(r.baseUrl || '', r.keyNew || '', r.type === 'anthropic' ? 'anthropic' : 'openai', r.slot || '');
+      setModelLists((m) => ({ ...m, [i]: { loading: false, models: d.models, err: d.models.length ? '' : '该端点没有返回模型' } }));
+    } catch (e) {
+      setModelLists((m) => ({ ...m, [i]: { loading: false, models: m[i]?.models || [], err: e instanceof Error ? e.message : '拉取失败' } }));
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -262,7 +305,9 @@ export default function SettingsPanel({ onClose }: Props) {
   const SLOT_EDIT: Record<string, { model: boolean; base: boolean }> = {
     openai: { model: true, base: true },
     relay: { model: true, base: true },
-    anthropic: { model: true, base: false },
+    // anthropic 也要能改 Base URL：官方直连之外，中转站/自建网关/兼容代理都靠它
+    // （后端 _SLOT_ENV_KEYS 已含 anthropic，改地址必须重填 Key 那道闸同样生效）。
+    anthropic: { model: true, base: true },
     siliconflow: { model: false, base: true },
     custom: { model: true, base: true },
   };
@@ -341,7 +386,29 @@ export default function SettingsPanel({ onClose }: Props) {
               )}
               <span>{r.type}</span>
               {ed && ed.model && (!ops?.media || r.adv) ? (
-                <input className="mock" value={r.model} placeholder={isCustom ? '模型名' : ''} onChange={(e) => ops?.onRow?.(i, { model: e.target.value })} />
+                <span className="model-cell">
+                  <input
+                    className="mock"
+                    value={r.model}
+                    placeholder={isCustom ? '模型名' : ''}
+                    list={`ml-${i}`}
+                    onChange={(e) => ops?.onRow?.(i, { model: e.target.value })}
+                  />
+                  {(modelLists[i]?.models?.length || 0) > 0 && (
+                    <datalist id={`ml-${i}`}>
+                      {modelLists[i].models.map((mid) => <option key={mid} value={mid} />)}
+                    </datalist>
+                  )}
+                  <button
+                    className="adv-btn"
+                    title="从该端点拉取可用模型列表，点击输入框即可选择"
+                    onClick={() => void pullModels(i, r)}
+                    disabled={modelLists[i]?.loading}
+                  >{modelLists[i]?.loading ? '拉取中…' : '拉取'}</button>
+                  {modelLists[i]?.err && (
+                    <span className="hint" title={modelLists[i].err}>⚠</span>
+                  )}
+                </span>
               ) : (
                 <span className={`cell-text${ops?.media && !r.model ? ' dim' : ''}`} title={r.model || '内建默认'}>
                   {r.model || (ops?.media ? '默认（内建）' : '')}
@@ -486,6 +553,55 @@ export default function SettingsPanel({ onClose }: Props) {
                     </div>
                     {renderBoard(chatRows, { onRow: (i, p) => updateRow(setChatRows, i, p), onPrimary: setPrimaryRow, onRemove: removeRow })}
                     <div className="add-row" onClick={addProvider}>＋ 添加供应商（填名称 / 模型 / Base URL / Key；点「设为主」切换生效通道）</div>
+                    {(() => {
+                      // 本机 agent 区块：装了 Claude Code / Gemini CLI 并登录过的用户不需要填 API Key。
+                      // 只展示「已装」的行 —— 没装的用户看一眼全是灰的只会困惑。
+                      const shown = localAgents.filter((a) => a.installed);
+                      if (localAgentsErr) return <div className="foot-note">本机 agent 探测失败：{localAgentsErr}</div>;
+                      if (!shown.length) return null;
+                      const usable = shown.filter((a) => a.supported);
+                      return (
+                        <div className="local-agents">
+                          <div className="la-head">
+                            本机 Agent
+                            <span className="desc">
+                              {usable.length
+                                ? `检测到可免 API Key 使用：${usable.map((a) => a.label).join('、')}`
+                                : '检测到的 CLI 暂无底座后端，仍需填 API Key'}
+                            </span>
+                          </div>
+                          {shown.map((a) => (
+                            <div className="la-row" key={a.id}>
+                              <span className="la-name">{a.label}<small>{a.path || a.command}</small></span>
+                              <span className={`la-state ${a.configured ? 'ok' : a.supported ? 'todo' : 'na'}`}>
+                                {a.configured ? '已接入' : a.supported ? '可接入' : '不支持'}
+                              </span>
+                              {a.supported && !a.configured && (a.models?.length ?? 0) > 0 && (
+                                <select
+                                  className="la-model"
+                                  value={laModels[a.id] ?? ''}
+                                  onChange={(e) => setLaModels((m) => ({ ...m, [a.id]: e.target.value }))}
+                                >
+                                  <option value="">默认模型</option>
+                                  {(a.models ?? []).map((m) => (
+                                    <option key={m.id} value={m.id}>{m.name}</option>
+                                  ))}
+                                </select>
+                              )}
+                              {a.supported && !a.configured ? (
+                                <button
+                                  className="btn btn-sm"
+                                  disabled={enabling === a.id}
+                                  onClick={() => void doEnableAgent(a.id, laModels[a.id] ?? '')}
+                                >{enabling === a.id ? '接入中…' : '一键接入'}</button>
+                              ) : <span />}
+                              <span className="la-hint">{a.loginHint}</span>
+                            </div>
+                          ))}
+                          {localAgentNote && <div className="foot-note">{localAgentNote}</div>}
+                        </div>
+                      );
+                    })()}
                     <div className="foot-note">改完点右上角「保存配置」（key 留空=不改）；自动降级链随统一网关接入开放。</div>
                   </section>
                 )}
