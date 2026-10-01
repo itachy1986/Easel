@@ -88,7 +88,7 @@ switch ($args[0]) {
         if (Test-Gateway) { Write-Host '[easel] Gateway already running'; break }
         New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
         Write-Host "[easel] Starting Easel gateway (profile: $Profile, port: $Port)..."
-        $command = "openclaw --profile $Profile gateway run --force --allow-unconfigured --bind loopback"
+        $command = "openclaw --profile $Profile gateway run --allow-unconfigured --bind loopback"
         Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $command `
             -WorkingDirectory $Root -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLogFile -WindowStyle Hidden | Out-Null
         $ready = $false
