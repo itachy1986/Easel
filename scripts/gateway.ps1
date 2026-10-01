@@ -4,6 +4,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $LogFile = Join-Path $env:TEMP 'easel-gateway.log'
 $ErrorLogFile = Join-Path $env:TEMP 'easel-gateway.error.log'
 $ConfigDir = Join-Path $HOME ".openclaw-$Profile"
+$GatewayReadyTimeoutSeconds = 120
 
 # ---- gateway 端口：不写死，与 easel/gateway_endpoint.py 同一套优先级 ----------
 # OpenClaw 对**非默认 profile** 不用 18789：它按 20000 + fnv1a32(profile) % 40000 分配
@@ -66,9 +67,147 @@ if (-not $Port) { $Port = ConvertTo-GatewayPort $env:EASEL_GATEWAY_PORT }
 if (-not $Port) { $Port = Get-ConfiguredPort $ConfigDir }
 if (-not $Port) { $Port = Get-ProfilePort $Profile }
 
+function Get-GatewayHttpStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [int]$TimeoutSeconds = 2,
+        [scriptblock]$Request
+    )
+    if ($Request) {
+        try { return [int](& $Request $Uri $TimeoutSeconds) }
+        catch { return 0 }
+    }
+    try {
+        $response = Invoke-WebRequest $Uri -UseBasicParsing -TimeoutSec $TimeoutSeconds
+        return [int]$response.StatusCode
+    }
+    catch {
+        try {
+            if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                return [int]$_.Exception.Response.StatusCode
+            }
+        }
+        catch { }
+        return 0
+    }
+}
+
+function Get-GatewayProbe {
+    param(
+        [int]$Port = $script:Port,
+        [int]$TimeoutSeconds = 2,
+        [scriptblock]$Request
+    )
+    $readyStatus = Get-GatewayHttpStatus -Uri "http://127.0.0.1:$Port/readyz" -TimeoutSeconds $TimeoutSeconds -Request $Request
+    if ($readyStatus -eq 200) {
+        return [pscustomobject]@{
+            Ready = $true; Live = $true; ReadyStatus = 200; HealthStatus = 0
+            CompatibilityFallback = $false
+        }
+    }
+    $healthStatus = Get-GatewayHttpStatus -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSeconds $TimeoutSeconds -Request $Request
+    $fallback = $readyStatus -eq 404 -and $healthStatus -eq 200
+    return [pscustomobject]@{
+        Ready = $fallback
+        Live = $healthStatus -eq 200
+        ReadyStatus = $readyStatus
+        HealthStatus = $healthStatus
+        CompatibilityFallback = $fallback
+    }
+}
+
 function Test-Gateway {
-    try { Invoke-WebRequest "http://127.0.0.1:$Port/healthz" -UseBasicParsing -TimeoutSec 2 | Out-Null; return $true }
-    catch { return $false }
+    $probe = Get-GatewayProbe -Port $Port
+    return $probe.Live
+}
+
+function Wait-GatewayReady {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [int]$TimeoutSeconds = 120,
+        [scriptblock]$Probe,
+        $Clock,
+        [scriptblock]$Sleep
+    )
+    if (-not $Clock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+    if (-not $Sleep) { $Sleep = { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds } }
+    if (-not $Probe) { $Probe = { param([int]$ProbeTimeout) Get-GatewayProbe -Port $script:Port -TimeoutSeconds $ProbeTimeout } }
+
+    $deadlineMilliseconds = [long]$TimeoutSeconds * 1000
+    $lastProbe = [pscustomobject]@{
+        Ready = $false; Live = $false; ReadyStatus = 0; HealthStatus = 0
+        CompatibilityFallback = $false
+    }
+    while ([long]$Clock.ElapsedMilliseconds -lt $deadlineMilliseconds) {
+        if ([bool]$Process.HasExited) {
+            return [pscustomobject]@{
+                Ready = $false; Kind = 'Exited'; ExitCode = $Process.ExitCode
+                Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+            }
+        }
+        $remainingMilliseconds = $deadlineMilliseconds - [long]$Clock.ElapsedMilliseconds
+        $probeTimeout = [math]::Max(1, [math]::Min(2, [math]::Ceiling($remainingMilliseconds / 1000.0)))
+        $lastProbe = & $Probe ([int]$probeTimeout)
+        if ($lastProbe.Ready) {
+            return [pscustomobject]@{
+                Ready = $true; Kind = 'Ready'; ExitCode = $null
+                Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+            }
+        }
+        if ([bool]$Process.HasExited) {
+            return [pscustomobject]@{
+                Ready = $false; Kind = 'Exited'; ExitCode = $Process.ExitCode
+                Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+            }
+        }
+        $remainingMilliseconds = $deadlineMilliseconds - [long]$Clock.ElapsedMilliseconds
+        if ($remainingMilliseconds -le 0) { break }
+        & $Sleep ([int][math]::Min(1000, $remainingMilliseconds))
+    }
+
+    # One last bounded probe closes the old sleep-without-recheck blind spot.
+    if ([bool]$Process.HasExited) {
+        return [pscustomobject]@{
+            Ready = $false; Kind = 'Exited'; ExitCode = $Process.ExitCode
+            Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+        }
+    }
+    $lastProbe = & $Probe 1
+    if ($lastProbe.Ready) {
+        return [pscustomobject]@{
+            Ready = $true; Kind = 'Ready'; ExitCode = $null
+            Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+        }
+    }
+    if ([bool]$Process.HasExited) {
+        return [pscustomobject]@{
+            Ready = $false; Kind = 'Exited'; ExitCode = $Process.ExitCode
+            Probe = $lastProbe; ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+        }
+    }
+    return [pscustomobject]@{
+        Ready = $false
+        Kind = if ($lastProbe.Live) { 'LiveNotReady' } else { 'AliveNotLive' }
+        ExitCode = $null
+        Probe = $lastProbe
+        ElapsedMilliseconds = [long]$Clock.ElapsedMilliseconds
+    }
+}
+
+function Get-GatewayFailureMessage {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][string]$LogFile,
+        [Parameter(Mandatory = $true)][string]$ErrorLogFile
+    )
+    $logs = "stdout log: $LogFile; stderr log: $ErrorLogFile"
+    if ($Result.Kind -eq 'Exited') {
+        return "Gateway process exited before readiness (exit code $($Result.ExitCode)); $logs"
+    }
+    if ($Result.Kind -eq 'LiveNotReady') {
+        return "Gateway healthz is live but readyz is not ready (HTTP $($Result.Probe.ReadyStatus)); $logs"
+    }
+    return "Gateway process is alive but HTTP is not live before the readiness deadline; $logs"
 }
 
 function Get-GatewayProcess {
@@ -85,26 +224,28 @@ function Stop-Gateway {
 
 switch ($args[0]) {
     'start' {
-        if (Test-Gateway) { Write-Host '[easel] Gateway already running'; break }
+        $existingProbe = Get-GatewayProbe -Port $Port
+        if ($existingProbe.Ready) { Write-Host '[easel] Gateway already running'; break }
         New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
         Write-Host "[easel] Starting Easel gateway (profile: $Profile, port: $Port)..."
         $command = "openclaw --profile $Profile gateway run --allow-unconfigured --bind loopback"
-        Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $command `
-            -WorkingDirectory $Root -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLogFile -WindowStyle Hidden | Out-Null
-        $ready = $false
-        1..20 | ForEach-Object {
-            if (-not $ready) {
-                if (Test-Gateway) { $ready = $true }
-                else { Start-Sleep -Seconds 1 }
+        $gatewayProcess = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $command `
+            -WorkingDirectory $Root -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLogFile -WindowStyle Hidden -PassThru
+        $result = Wait-GatewayReady -Process $gatewayProcess -TimeoutSeconds $GatewayReadyTimeoutSeconds
+        if ($result.Ready) {
+            if ($result.Probe.CompatibilityFallback) {
+                Write-Host '[easel] Gateway started (OpenClaw /readyz unavailable; using /healthz compatibility fallback)'
             }
+            else { Write-Host '[easel] Gateway started' }
         }
-        if ($ready) { Write-Host '[easel] Gateway started' }
-        else { Write-Error "Gateway 启动失败；请检查 $LogFile 和 $ErrorLogFile"; exit 1 }
+        else { Write-Error (Get-GatewayFailureMessage -Result $result -LogFile $LogFile -ErrorLogFile $ErrorLogFile); exit 1 }
     }
     'stop' { Stop-Gateway }
     'restart' { Stop-Gateway; Start-Sleep -Seconds 2; & $PSCommandPath start }
     'status' {
-        if (Test-Gateway) { Write-Host "[easel] Gateway running (profile: $Profile, port: $Port)" }
+        $probe = Get-GatewayProbe -Port $Port
+        if ($probe.Ready) { Write-Host "[easel] Gateway running (profile: $Profile, port: $Port)" }
+        elseif ($probe.Live) { Write-Host "[easel] Gateway live but not ready (profile: $Profile, port: $Port, readyz: HTTP $($probe.ReadyStatus))" }
         else { Write-Host "[easel] Gateway not running (profile: $Profile, port: $Port)" }
     }
     'logs' { Get-Content $LogFile -Wait }
