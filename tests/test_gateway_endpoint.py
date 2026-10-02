@@ -347,3 +347,370 @@ def test_gateway_ps1_start_does_not_force_port_takeover():
 
     assert "--force" not in command_line
     assert "gateway run --allow-unconfigured --bind loopback" in command_line
+
+
+def test_gateway_ps1_start_tracks_child_and_uses_readiness_deadline():
+    """启动路径必须等待真实子进程，而不是退回固定次数轮询。"""
+    text = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+
+    assert "$GatewayReadyTimeoutSeconds = 120" in text
+    assert "-PassThru" in text
+    assert "$gatewayProcess = & $Launch" in text
+    assert "$result = & $Wait $gatewayProcess" in text
+    assert (
+        "Wait-GatewayReady -Process $Process "
+        "-TimeoutSeconds $script:GatewayReadyTimeoutSeconds"
+    ) in text
+
+
+_PS_READINESS_HARNESS = r'''
+param(
+    [Parameter(Mandatory = $true)][string]$GatewayScriptB64,
+    [Parameter(Mandatory = $true)][string]$Scenario
+)
+$ErrorActionPreference = 'Stop'
+$src = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($GatewayScriptB64))
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { throw 'gateway.ps1 parse error: ' + $errors[0] }
+foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+
+$clock = [pscustomobject]@{ ElapsedMilliseconds = 0 }
+$process = [pscustomobject]@{ HasExited = $false; ExitCode = $null; Id = 4242 }
+$state = [pscustomobject]@{ Probes = 0; Sleeps = 0 }
+$sleep = {
+    param([int]$Milliseconds)
+    $state.Sleeps += 1
+    $clock.ElapsedMilliseconds += $Milliseconds
+}
+$probe = {
+    param([int]$TimeoutSeconds)
+    $state.Probes += 1
+    switch ($Scenario) {
+        'slow-success' {
+            # Mirror the old worst case: a failed HTTP probe can consume ~2 s,
+            # followed by the old 1 s sleep.  Probe 22 therefore becomes ready
+            # only after the former ~60 s wall-clock window has elapsed.
+            $clock.ElapsedMilliseconds += 2000
+            if ($state.Probes -ge 22) {
+                return [pscustomobject]@{ Ready = $true; Live = $true; ReadyStatus = 200; CompatibilityFallback = $false }
+            }
+        }
+        'early-exit' {
+            if ($state.Probes -ge 3) { $process.HasExited = $true; $process.ExitCode = 17 }
+        }
+        'final-probe-success' {
+            if ($clock.ElapsedMilliseconds -ge 5000) {
+                return [pscustomobject]@{ Ready = $true; Live = $true; ReadyStatus = 200; CompatibilityFallback = $false }
+            }
+        }
+        'live-not-ready' {
+            return [pscustomobject]@{ Ready = $false; Live = $true; ReadyStatus = 503; CompatibilityFallback = $false }
+        }
+        'ready-success' {
+            return [pscustomobject]@{ Ready = $true; Live = $true; ReadyStatus = 200; CompatibilityFallback = $false }
+        }
+    }
+    return [pscustomobject]@{ Ready = $false; Live = $false; ReadyStatus = 0; CompatibilityFallback = $false }
+}
+
+if ($Scenario -eq 'fallback') {
+    $request = {
+        param([string]$Uri, [int]$TimeoutSeconds)
+        if ($Uri.EndsWith('/readyz')) { return 404 }
+        if ($Uri.EndsWith('/healthz')) { return 200 }
+        return 500
+    }
+    $fallback = Get-GatewayProbe -Port 37289 -TimeoutSeconds 2 -Request $request
+    [ordered]@{
+        ready = $fallback.Ready
+        live = $fallback.Live
+        fallback = $fallback.CompatibilityFallback
+        readyStatus = $fallback.ReadyStatus
+        healthStatus = $fallback.HealthStatus
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
+$timeout = if ($Scenario -eq 'slow-success') { 120 } else { 5 }
+$result = Wait-GatewayReady -Process $process -TimeoutSeconds $timeout -Probe $probe -Clock $clock -Sleep $sleep
+$message = if ($result.Ready) { '' } else {
+    Get-GatewayFailureMessage -Result $result -LogFile 'C:\temp\gateway.log' -ErrorLogFile 'C:\temp\gateway.error.log'
+}
+[ordered]@{
+    ready = $result.Ready
+    kind = $result.Kind
+    exitCode = $result.ExitCode
+    probes = $state.Probes
+    sleeps = $state.Sleeps
+    elapsedMs = $clock.ElapsedMilliseconds
+    message = $message
+} | ConvertTo-Json -Compress
+'''.lstrip()
+
+
+def _run_gateway_readiness_scenario(isolated, scenario):
+    harness = isolated / f"gateway-readiness-{scenario}.ps1"
+    harness.write_text(_PS_READINESS_HARNESS, encoding="utf-8")
+    source = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness),
+         "-GatewayScriptB64", _b64(source), "-Scenario", scenario],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows readiness")
+def test_gateway_ps1_slow_start_can_succeed_after_old_twenty_probe_limit(isolated):
+    result = _run_gateway_readiness_scenario(isolated, "slow-success")
+    assert result["ready"] is True
+    assert result["kind"] == "Ready"
+    assert result["probes"] == 22
+    assert result["elapsedMs"] > 60000
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows readiness")
+def test_gateway_ps1_early_exit_fails_fast_with_exit_code_and_log_paths(isolated):
+    result = _run_gateway_readiness_scenario(isolated, "early-exit")
+    assert result["ready"] is False
+    assert result["kind"] == "Exited"
+    assert result["exitCode"] == 17
+    assert result["probes"] == 3
+    assert result["elapsedMs"] < 5000
+    assert "exit code 17" in result["message"]
+    assert "C:\\temp\\gateway.log" in result["message"]
+    assert "C:\\temp\\gateway.error.log" in result["message"]
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows readiness")
+def test_gateway_ps1_deadline_performs_a_final_probe_before_failure(isolated):
+    result = _run_gateway_readiness_scenario(isolated, "final-probe-success")
+    assert result["ready"] is True
+    assert result["kind"] == "Ready"
+    assert result["elapsedMs"] == 5000
+    assert result["probes"] == 6
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows readiness")
+def test_gateway_ps1_alive_timeout_distinguishes_not_live_from_live_not_ready(isolated):
+    not_live = _run_gateway_readiness_scenario(isolated, "alive-timeout")
+    assert not_live["ready"] is False
+    assert not_live["kind"] == "AliveNotLive"
+    assert "alive but HTTP is not live" in not_live["message"]
+
+    live = _run_gateway_readiness_scenario(isolated, "live-not-ready")
+    assert live["ready"] is False
+    assert live["kind"] == "LiveNotReady"
+    assert "healthz is live but readyz is not ready" in live["message"]
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows readiness")
+def test_gateway_ps1_readyz_success_and_explicit_healthz_compatibility_fallback(isolated):
+    ready = _run_gateway_readiness_scenario(isolated, "ready-success")
+    assert ready["ready"] is True
+    assert ready["probes"] == 1
+
+    fallback = _run_gateway_readiness_scenario(isolated, "fallback")
+    assert fallback == {
+        "ready": True,
+        "live": True,
+        "fallback": True,
+        "readyStatus": 404,
+        "healthStatus": 200,
+    }
+
+
+_PS_START_HARNESS = r'''
+param(
+    [Parameter(Mandatory = $true)][string]$GatewayScriptB64,
+    [Parameter(Mandatory = $true)][string]$Scenario
+)
+$ErrorActionPreference = 'Stop'
+$src = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($GatewayScriptB64))
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { throw 'gateway.ps1 parse error: ' + $errors[0] }
+foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+
+$state = [pscustomobject]@{ Finds = 0; Launches = 0; Waits = 0 }
+$process = [pscustomobject]@{ HasExited = $false; ExitCode = $null; Id = 4242 }
+$probe = {
+    if ($Scenario -eq 'existing-ready') {
+        return [pscustomobject]@{ Ready = $true; Live = $true; ReadyStatus = 200; CompatibilityFallback = $false }
+    }
+    if ($Scenario.StartsWith('existing-live')) {
+        return [pscustomobject]@{ Ready = $false; Live = $true; ReadyStatus = 503; CompatibilityFallback = $false }
+    }
+    return [pscustomobject]@{ Ready = $false; Live = $false; ReadyStatus = 0; CompatibilityFallback = $false }
+}
+$find = {
+    $state.Finds += 1
+    if ($Scenario -eq 'existing-live-unavailable') { return $null }
+    return $process
+}
+$launch = { $state.Launches += 1; return $process }
+$wait = {
+    param($Process)
+    $state.Waits += 1
+    if ($Scenario -eq 'existing-live-exit') {
+        return [pscustomobject]@{
+            Ready = $false; Kind = 'Exited'; ExitCode = 23
+            Probe = [pscustomobject]@{ Ready = $false; Live = $true; ReadyStatus = 503 }
+        }
+    }
+    return [pscustomobject]@{
+        Ready = $true; Kind = 'Ready'; ExitCode = $null
+        Probe = [pscustomobject]@{ Ready = $true; Live = $true; ReadyStatus = 200; CompatibilityFallback = $false }
+    }
+}
+$notify = { param([string]$Message) }
+$result = Invoke-GatewayStart -Probe $probe -FindProcess $find -Launch $launch -Wait $wait -Notify $notify
+$message = if ($result.Ready) { '' } else {
+    Get-GatewayFailureMessage -Result $result -LogFile 'C:\temp\gateway.log' -ErrorLogFile 'C:\temp\gateway.error.log'
+}
+[ordered]@{
+    ready = $result.Ready
+    kind = $result.Kind
+    exitCode = $result.ExitCode
+    spawned = $result.Spawned
+    finds = $state.Finds
+    launches = $state.Launches
+    waits = $state.Waits
+    message = $message
+} | ConvertTo-Json -Compress
+'''.lstrip()
+
+
+def _run_gateway_start_scenario(isolated, scenario):
+    harness = isolated / f"gateway-start-{scenario}.ps1"
+    harness.write_text(_PS_START_HARNESS, encoding="utf-8")
+    source = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness),
+         "-GatewayScriptB64", _b64(source), "-Scenario", scenario],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows start orchestration")
+def test_gateway_ps1_existing_ready_does_not_spawn(isolated):
+    result = _run_gateway_start_scenario(isolated, "existing-ready")
+    assert result == {
+        "ready": True, "kind": "AlreadyReady", "exitCode": None,
+        "spawned": False, "finds": 0, "launches": 0, "waits": 0,
+        "message": "",
+    }
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows start orchestration")
+def test_gateway_ps1_existing_live_not_ready_waits_until_ready_without_spawn(isolated):
+    result = _run_gateway_start_scenario(isolated, "existing-live-ready")
+    assert result["ready"] is True
+    assert result["kind"] == "Ready"
+    assert result["spawned"] is False
+    assert result["finds"] == 1
+    assert result["launches"] == 0
+    assert result["waits"] == 1
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows start orchestration")
+def test_gateway_ps1_existing_live_not_ready_exit_fails_without_spawn(isolated):
+    result = _run_gateway_start_scenario(isolated, "existing-live-exit")
+    assert result["ready"] is False
+    assert result["kind"] == "Exited"
+    assert result["exitCode"] == 23
+    assert result["spawned"] is False
+    assert result["launches"] == 0
+    assert result["waits"] == 1
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows start orchestration")
+def test_gateway_ps1_existing_live_not_ready_without_process_fails_safe(isolated):
+    result = _run_gateway_start_scenario(isolated, "existing-live-unavailable")
+    assert result["ready"] is False
+    assert result["kind"] == "ExistingProcessUnavailable"
+    assert result["spawned"] is False
+    assert result["launches"] == 0
+    assert result["waits"] == 0
+    assert "refusing to start another instance" in result["message"]
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows start orchestration")
+def test_gateway_ps1_spawns_only_when_existing_gateway_is_not_live(isolated):
+    result = _run_gateway_start_scenario(isolated, "not-running")
+    assert result["ready"] is True
+    assert result["spawned"] is True
+    assert result["finds"] == 0
+    assert result["launches"] == 1
+    assert result["waits"] == 1
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 pwsh / powershell 才能回归 Windows probe budget")
+def test_gateway_ps1_readyz_and_healthz_share_total_probe_budget(isolated):
+    harness = isolated / "gateway-probe-budget.ps1"
+    harness.write_text(r'''
+param([Parameter(Mandatory = $true)][string]$GatewayScriptB64)
+$ErrorActionPreference = 'Stop'
+$src = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($GatewayScriptB64))
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+foreach ($name in @('Get-GatewayHttpStatus', 'Get-GatewayProbe')) {
+    $fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$timeouts = [System.Collections.Generic.List[int]]::new()
+$request = {
+    param([string]$Uri, [int]$TimeoutSeconds)
+    $timeouts.Add($TimeoutSeconds)
+    if ($Uri.EndsWith('/readyz')) { return 503 }
+    return 200
+}
+$probe = Get-GatewayProbe -Port 37289 -TimeoutSeconds 2 -Request $request
+$shortTimeouts = [System.Collections.Generic.List[int]]::new()
+$shortRequest = {
+    param([string]$Uri, [int]$TimeoutSeconds)
+    $shortTimeouts.Add($TimeoutSeconds)
+    return 503
+}
+$shortProbe = Get-GatewayProbe -Port 37289 -TimeoutSeconds 1 -Request $shortRequest
+[ordered]@{
+    ready = $probe.Ready
+    live = $probe.Live
+    timeouts = @($timeouts)
+    total = ($timeouts | Measure-Object -Sum).Sum
+    shortTimeouts = @($shortTimeouts)
+    shortTotal = ($shortTimeouts | Measure-Object -Sum).Sum
+} | ConvertTo-Json -Compress
+'''.lstrip(), encoding="utf-8")
+    source = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness),
+         "-GatewayScriptB64", _b64(source)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["ready"] is False
+    assert result["live"] is True
+    assert result["timeouts"] == [1, 1]
+    assert result["total"] <= 2
+    assert result["shortTimeouts"] == [1]
+    assert result["shortTotal"] <= 1
+
+
+def test_gateway_ps1_restart_remains_stop_then_start():
+    text = (PROJECT_ROOT / "scripts" / "gateway.ps1").read_text(encoding="utf-8")
+    restart_line = next(line.strip() for line in text.splitlines() if line.strip().startswith("'restart'"))
+    assert restart_line.index("Stop-Gateway") < restart_line.index("& $PSCommandPath start")
