@@ -204,6 +204,17 @@ function Is-UsableKey($Value) { return -not [string]::IsNullOrWhiteSpace($Value)
 function Get-OpenAIProviderId($BaseUrl) {
     $normalized = "$BaseUrl".Trim().TrimEnd('/')
     if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized -ceq 'https://api.openai.com/v1') { return 'openai' }
+    $parsed = $null
+    $isHttpUrl = [System.Uri]::TryCreate($normalized, [System.UriKind]::Absolute, [ref]$parsed) -and
+        @('http', 'https') -contains $parsed.Scheme -and
+        -not [string]::IsNullOrWhiteSpace($parsed.Host) -and
+        $normalized -notmatch '\s' -and
+        -not $normalized.Contains('@')
+    if (-not $isHttpUrl) {
+        throw [System.ArgumentException]::new(
+            'OPENAI_BASE_URL 无效：必须为空、官方 OpenAI URL 或带 host 的 HTTP(S) URL。'
+        )
+    }
     return 'openai-compatible'
 }
 if (-not (Is-UsableKey $envValues['ANTHROPIC_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_API_KEY']) -and -not (Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN']) -and -not (Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_MAAS_API_KEY'])) {

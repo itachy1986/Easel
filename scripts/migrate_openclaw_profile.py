@@ -27,12 +27,28 @@ def _normalized_base_url(base_url: object) -> str:
     return base_url.strip().rstrip("/")
 
 
+def _is_valid_custom_openai_base(normalized: str) -> bool:
+    if any(character.isspace() or ord(character) < 32 for character in normalized):
+        return False
+    if "@" in normalized:
+        return False
+    try:
+        parsed = urlsplit(normalized)
+        host = parsed.hostname
+        parsed.port
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(host)
+
+
 def classify_openai_provider(base_url: object) -> str:
     """Return the canonical provider key for a newly written OpenAI-style URL."""
     normalized = _normalized_base_url(base_url)
     if not normalized or normalized == OFFICIAL_OPENAI_BASE_URL:
         return OPENAI_PROVIDER
-    return OPENAI_COMPATIBLE_PROVIDER
+    if _is_valid_custom_openai_base(normalized):
+        return OPENAI_COMPATIBLE_PROVIDER
+    raise ValueError("invalid OpenAI Base URL; expected an absolute HTTP(S) URL with a host")
 
 
 def _is_clear_custom_openai_base(base_url: object) -> bool:
@@ -40,8 +56,7 @@ def _is_clear_custom_openai_base(base_url: object) -> bool:
     normalized = _normalized_base_url(base_url)
     if not normalized or normalized == OFFICIAL_OPENAI_BASE_URL:
         return False
-    parsed = urlsplit(normalized)
-    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+    return _is_valid_custom_openai_base(normalized)
 
 
 def _migrate_primary_reference(config: dict) -> bool:

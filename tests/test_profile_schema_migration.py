@@ -229,6 +229,7 @@ def test_choice_zero_remains_credential_blind_and_writes_no_provider_or_primary(
     ("https://api.openai.com/v1", "openai"),
     ("https://api.openai.com/v1/", "openai"),
     ("https://api.openai.com/v1//", "openai"),
+    ("http://localhost:8080/v1", "openai-compatible"),
     ("https://api.openai.com/v1/chat/completions", "openai-compatible"),
     ("https://api.deepseek.com/v1", "openai-compatible"),
     ("https://proxy.example.com/openai/v1", "openai-compatible"),
@@ -237,6 +238,21 @@ def test_openai_provider_classification_is_exact(base_url, expected):
     migrator = _load_migrator()
 
     assert migrator.classify_openai_provider(base_url) == expected
+
+
+@pytest.mark.parametrize("base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+def test_openai_provider_classification_rejects_non_http_or_hostless_urls(base_url):
+    migrator = _load_migrator()
+
+    with pytest.raises(ValueError, match="Base URL") as exc:
+        migrator.classify_openai_provider(base_url)
+
+    assert base_url not in str(exc.value)
 
 
 def test_custom_openai_provider_is_moved_deeply_and_primary_is_migrated(tmp_path):
@@ -292,6 +308,33 @@ def test_official_openai_provider_is_byte_identical_and_has_no_backup(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert config_path.read_bytes() == original
     assert _backups(config_path) == []
+
+
+@pytest.mark.parametrize("bad_base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+def test_invalid_legacy_openai_base_is_noop_without_backup(tmp_path, bad_base_url):
+    config_path = tmp_path / "openclaw.json"
+    original = json.dumps({
+        "models": {"providers": {"openai": {
+            "baseUrl": bad_base_url,
+            "api": "openai-completions",
+            "apiKey": "secret-invalid-base-sentinel",
+            "models": [{"id": "model-x", "name": "Model X"}],
+        }}},
+        "agents": {"defaults": {"model": {"primary": "openai/model-x"}}},
+    }, indent=2).encode("utf-8")
+    config_path.write_bytes(original)
+
+    proc = _run_migration(config_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert config_path.read_bytes() == original
+    assert _backups(config_path) == []
+    assert "secret-invalid-base-sentinel" not in proc.stdout + proc.stderr
 
 
 def test_equivalent_target_collision_converges_and_is_idempotent(tmp_path):

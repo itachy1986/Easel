@@ -71,13 +71,15 @@ def _slice(lines: list[str], start: str, end: str, *, keep_end: bool) -> str:
 def _auth_block() -> str:
     lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
     helper = _slice(lines, "usable_key() {", "}", keep_end=True)
+    classifier = _slice(lines, "openai_provider_id() {", "}", keep_end=True)
     body = _slice(lines, 'DEFAULT_PRIMARY_MODEL="anthropic',
                   "# 整个 agent run 的总时长上限", keep_end=False)
-    return helper + "\n\n" + body
+    return helper + "\n\n" + classifier + "\n\n" + body
 
 
-def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
-    """跑认证段，返回 (stdout, 实际写进 openclaw 的配置)。"""
+def _run_auth_process(
+    tmp_path: Path, **env: str
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     calls = tmp_path / "oc-calls.log"
     script = textwrap.dedent(f"""
         set -u
@@ -98,13 +100,19 @@ def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
 
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           timeout=60, env={"PATH": os.environ["PATH"], **env})
-    assert proc.returncode == 0, f"认证段执行失败：{proc.stderr}"
     written: dict[str, str] = {}
     if calls.is_file():
         for line in calls.read_text(encoding="utf-8").splitlines():
             if " = " in line:
                 k, v = line.split(" = ", 1)
                 written[k] = v
+    return proc, written
+
+
+def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
+    """跑认证段，返回 (stdout, 实际写进 openclaw 的配置)。"""
+    proc, written = _run_auth_process(tmp_path, **env)
+    assert proc.returncode == 0, f"认证段执行失败：{proc.stderr}"
     return proc.stdout, written
 
 
@@ -148,6 +156,28 @@ def test_official_openai_base_uses_canonical_provider(tmp_path):
     assert written.get("models.providers.openai.baseUrl") == "https://api.openai.com/v1/"
     assert written.get("agents.defaults.model.primary") == "openai/gpt-4o-mini"
     assert not any(k.startswith("models.providers.openai-compatible.") for k in written)
+
+
+@pytest.mark.parametrize("bad_base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+@needs_bash
+def test_invalid_openai_base_fails_before_posix_config_mutation(tmp_path, bad_base_url):
+    proc, written = _run_auth_process(
+        tmp_path,
+        OPENAI_API_KEY="sk-invalid-base-sentinel",
+        OPENAI_BASE_URL=bad_base_url,
+        OPENAI_MODEL="model-x",
+    )
+
+    assert proc.returncode != 0
+    assert written == {}
+    assert "OPENAI_BASE_URL" in proc.stderr
+    assert bad_base_url not in proc.stdout + proc.stderr
+    assert "sk-invalid-base-sentinel" not in proc.stdout + proc.stderr
 
 
 @needs_bash
@@ -333,11 +363,35 @@ def test_windows_openai_provider_classifier(base_url, expected):
     assert proc.stdout.strip() == expected
 
 
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize("base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///C:/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+def test_windows_openai_provider_classifier_rejects_invalid_urls(base_url):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + "\nGet-OpenAIProviderId $env:EASEL_TEST_BASE_URL"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        env={**os.environ, "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    assert proc.returncode != 0
+    assert "openai-compatible" not in proc.stdout
+    assert base_url not in proc.stdout + proc.stderr
+
+
 def test_posix_setup_routes_openai_by_exact_base_url():
     text = SETUP_SH.read_text(encoding="utf-8")
 
-    assert 'OPENAI_PROVIDER="openai-compatible"' in text
-    assert 'OPENAI_PROVIDER="openai"' in text
+    assert "openai_provider_id() {" in text
+    assert 'OPENAI_PROVIDER="$(openai_provider_id "$OPENAI_BASE_URL")"' in text
     assert 'models.providers."$OPENAI_PROVIDER".api' in text
     assert 'DEFAULT_PRIMARY_MODEL="$OPENAI_PROVIDER/$OPENAI_MODEL"' in text
 

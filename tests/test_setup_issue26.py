@@ -97,6 +97,7 @@ def _openai_models_written(tmp_path: Path, **env: str) -> str:
     """跑 setup.sh 的 OpenAI 分支，返回写进 models 的那条 JSON。"""
     lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
     helper = _slice(lines, "usable_key() {", "}", keep_end=True)
+    classifier = _slice(lines, "openai_provider_id() {", "}", keep_end=True)
     body = _slice(lines, 'if usable_key "${OPENAI_API_KEY:-}"', "# ---- 10. OpenClaw agent 模型", keep_end=False)
     calls = tmp_path / "oc.log"
     script = textwrap.dedent(f"""
@@ -114,7 +115,7 @@ def _openai_models_written(tmp_path: Path, **env: str) -> str:
             return 0
         }}
         OC=_oc
-    """) + "\n" + helper + "\n\n" + body
+    """) + "\n" + helper + "\n\n" + classifier + "\n\n" + body
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           timeout=60, env={"PATH": os.environ["PATH"], **env})
     assert proc.returncode == 0, f"OpenAI 分支执行失败：{proc.stderr}"

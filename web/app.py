@@ -762,13 +762,13 @@ _SLOT_ENV_KEYS = {
 
 def _valid_base_url(u: str) -> bool:
     '整串校验（不是只看开头）：必须是 http(s)://host，且不带控制字符与 URL 内嵌凭据。'
-    if any(c in u for c in '\r\n\t\x00') or '@' in u:
+    if not isinstance(u, str) or not u.strip():
         return False
     try:
-        p = urllib.parse.urlparse(u)
-    except ValueError:
+        classify_openai_provider(u)
+    except (TypeError, ValueError):
         return False
-    return p.scheme in ('http', 'https') and bool(p.hostname)
+    return True
 
 
 def _ssrf_safe(u: str) -> bool:

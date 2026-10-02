@@ -187,12 +187,18 @@ def test_local_gateway_helper():
 @pytest.mark.parametrize("bad", [
     "http://u:p@evil.example.com/v1",
     "ftp://evil.example.com",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
     "https://api.openai.com/v1\tx",
     "javascript:alert(1)",
 ])
 def test_base_url_validated_whole_string(client, bad):
-    _assert_blocked(client, {"channel": "chat",
-                             "rows": [{"slot": "openai", "baseUrl": bad, "key": "sk-new"}]})
+    resp = _save(client, {"channel": "chat",
+                          "rows": [{"slot": "openai", "baseUrl": bad, "key": "sk-new"}]})
+
+    assert resp.status_code == 400
+    assert client.env_file.read_text(encoding="utf-8") == ORIGINAL_ENV, ".env 被改动了"
 
 
 @pytest.mark.parametrize("url,ok", [

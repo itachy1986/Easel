@@ -437,6 +437,56 @@ usable_key() {
     return 0
 }
 
+openai_provider_id() {
+    local normalized scheme rest authority host suffix port
+    normalized="$(printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    while [ "${normalized%/}" != "$normalized" ]; do
+        normalized="${normalized%/}"
+    done
+    if [ -z "$normalized" ] || [ "$normalized" = "https://api.openai.com/v1" ]; then
+        printf '%s' 'openai'
+        return 0
+    fi
+    case "$normalized" in
+        *[[:space:]]*|*'@'*) return 1 ;;
+        *://*) ;;
+        *) return 1 ;;
+    esac
+    scheme="$(printf '%s' "${normalized%%://*}" | tr '[:upper:]' '[:lower:]')"
+    case "$scheme" in
+        http|https) ;;
+        *) return 1 ;;
+    esac
+    rest="${normalized#*://}"
+    authority="${rest%%/*}"
+    authority="${authority%%\?*}"
+    authority="${authority%%\#*}"
+    [ -n "$authority" ] || return 1
+    case "$authority" in
+        \[*\]*)
+            host="${authority#\[}"
+            host="${host%%\]*}"
+            [ -n "$host" ] || return 1
+            suffix="${authority#*\]}"
+            ;;
+        *'['*|*']'*) return 1 ;;
+        *)
+            host="${authority%%:*}"
+            [ -n "$host" ] || return 1
+            suffix="${authority#"$host"}"
+            ;;
+    esac
+    case "$suffix" in
+        '') ;;
+        :*)
+            port="${suffix#:}"
+            case "$port" in ''|*[!0-9]*) return 1 ;; esac
+            ;;
+        *) return 1 ;;
+    esac
+    printf '%s' 'openai-compatible'
+}
+
 MODEL_CONFIGURED=false
 if usable_key "${ANTHROPIC_API_KEY:-}"; then
     MODEL_CONFIGURED=true
@@ -521,14 +571,9 @@ if usable_key "${OPENAI_API_KEY:-}" && ! usable_key "${ANTHROPIC_API_KEY:-}" \
    && ! { usable_key "${EASEL_LLM_API_KEY:-}" && [ -n "${EASEL_LLM_BASE_URL:-}" ]; }; then
     OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o}"
     OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-    OPENAI_BASE_NORMALIZED="$OPENAI_BASE_URL"
-    while [ "${OPENAI_BASE_NORMALIZED%/}" != "$OPENAI_BASE_NORMALIZED" ]; do
-        OPENAI_BASE_NORMALIZED="${OPENAI_BASE_NORMALIZED%/}"
-    done
-    if [ "$OPENAI_BASE_NORMALIZED" = "https://api.openai.com/v1" ]; then
-        OPENAI_PROVIDER="openai"
-    else
-        OPENAI_PROVIDER="openai-compatible"
+    if ! OPENAI_PROVIDER="$(openai_provider_id "$OPENAI_BASE_URL")"; then
+        echo "OPENAI_BASE_URL 无效：必须为空、官方 OpenAI URL 或带 host 的 HTTP(S) URL。" >&2
+        exit 1
     fi
     # 未声明 maxTokens 时 OpenClaw 会自行推导，部分 OpenAI 兼容网关据此拒绝请求
     # （issue #26 P0-2）。默认值对齐默认模型 gpt-4o 的真实上限（128K 上下文 /
