@@ -122,6 +122,9 @@ Info '安装 Playwright Chromium...'
 if ($LASTEXITCODE -ne 0) { Fail 'Playwright Chromium 安装失败。' }
 
 Info '准备 Easel OpenClaw profile...'
+$openclawJson = Join-Path $HOME '.openclaw-easel\openclaw.json'
+& $Python (Join-Path $Root 'scripts\migrate_openclaw_profile.py') $openclawJson
+if ($LASTEXITCODE -ne 0) { Fail 'OpenClaw legacy model schema migration failed; existing config was not replaced.' }
 $onboardHelp = (& openclaw onboard --help 2>&1 | Out-String)
 $onboardArgs = @('--profile','easel','onboard','--non-interactive','--mode','local','--accept-risk')
 foreach ($flag in @('--skip-health','--skip-channels','--skip-skills','--skip-ui','--skip-hooks','--skip-search','--skip-daemon')) {
@@ -208,7 +211,6 @@ $envValues = Read-EnvFile $envPath
 # 部分 OpenClaw 版本执行 config unset 后会把字段留成 null 而非真正删除该键，
 # 一旦落盘就再也无法通过 config set/doctor --fix 修复（每次校验都先失败）。
 # 这里在写入任何配置前，先把 models.providers.* 下残留的 null 叶子节点原地清空。
-$openclawJson = Join-Path $HOME '.openclaw-easel\openclaw.json'
 if (Test-Path $openclawJson) {
     @'
 import json, sys

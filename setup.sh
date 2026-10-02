@@ -247,6 +247,11 @@ OC="$OPENCLAW_BIN --profile $PROFILE"
 # ---- 4. 初始化 Easel 专属 OpenClaw profile ----
 step "4/8" "初始化 Easel profile" "独立配置、独立 workspace、独立 Gateway"
 info "初始化 Easel profile (--profile $PROFILE)..."
+OPENCLAW_JSON="$HOME/.openclaw-${PROFILE}/openclaw.json"
+if ! python3 "$PROJECT_ROOT/scripts/migrate_openclaw_profile.py" "$OPENCLAW_JSON"; then
+    echo "OpenClaw legacy model schema migration failed; existing config was not replaced." >&2
+    exit 1
+fi
 if [ -f "$HOME/.openclaw-${PROFILE}/openclaw.json" ]; then
     ok "Profile 已存在"
 else
@@ -354,7 +359,6 @@ source "$PROJECT_ROOT/.env" 2>/dev/null || true
 # 部分 OpenClaw 版本执行 config unset 后会把字段留成 null 而非真正删除该键，
 # 一旦落盘就再也无法通过 config set/doctor --fix 修复（每次校验都先失败）。
 # 这里在写入任何配置前，先把 models.providers.* 下残留的 null 叶子节点原地清空。
-OPENCLAW_JSON="$HOME/.openclaw-${PROFILE}/openclaw.json"
 if [ -f "$OPENCLAW_JSON" ]; then
     python3 - "$OPENCLAW_JSON" <<'PY'
 import json
