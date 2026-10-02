@@ -213,8 +213,23 @@ def migrate(path: Path) -> int:
     return changed
 
 
+def _classify_openai_provider_from_stdin() -> int:
+    try:
+        provider = classify_openai_provider(sys.stdin.read())
+    except ValueError:
+        print(
+            "OpenAI Base URL classification failed: expected an absolute HTTP(S) URL with a host",
+            file=sys.stderr,
+        )
+        return 1
+    print(provider)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--classify-openai-provider-stdin"]:
+        return _classify_openai_provider_from_stdin()
     if len(arguments) != 1:
         print("usage: migrate_openclaw_profile.py OPENCLAW_JSON", file=sys.stderr)
         return 2

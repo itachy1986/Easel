@@ -18,9 +18,11 @@ $OC 换成记录器，所以测的是真代码、不是复制品。
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,10 +34,30 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SH = PROJECT_ROOT / "setup.sh"
 SETUP_PS1 = PROJECT_ROOT / "setup.ps1"
+MIGRATOR = PROJECT_ROOT / "scripts" / "migrate_openclaw_profile.py"
 PWSH = shutil.which("pwsh") or shutil.which("powershell")
+
+OPENAI_BASE_URL_MATRIX = [
+    ("http://localhost/v1", "openai-compatible"),
+    ("http://localhost:0/v1", "openai-compatible"),
+    ("http://localhost:65535/v1", "openai-compatible"),
+    ("http://localhost:99999/v1", None),
+    ("http://localhost:-1/v1", None),
+    ("http://[::1]:8080/v1", "openai-compatible"),
+    ("http://[not-ipv6]:8080/v1", None),
+    ("http://user:credential@example.com/v1", None),
+]
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from easel.commands import doctor  # noqa: E402
+
+
+def _load_migrator():
+    spec = importlib.util.spec_from_file_location("easel_profile_migrator_for_setup", MIGRATOR)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ── setup.sh：把真代码切出来在沙箱里跑 ────────────────────────────────
@@ -83,8 +105,8 @@ def _run_auth_process(
     calls = tmp_path / "oc-calls.log"
     script = textwrap.dedent(f"""
         set -u
-        PROJECT_ROOT={tmp_path}
-        CFG={calls}
+        PROJECT_ROOT={shlex.quote(str(PROJECT_ROOT))}
+        CFG={shlex.quote(str(calls))}
         : > "$CFG"
         ok()   {{ echo "OK|$*"; }}
         warn() {{ echo "WARN|$*"; }}
@@ -342,6 +364,17 @@ def _ps_openai_classifier_source() -> str:
     return "\n".join(selected)
 
 
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+def test_python_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    classify = _load_migrator().classify_openai_provider
+
+    if expected is None:
+        with pytest.raises(ValueError, match="Base URL"):
+            classify(base_url)
+    else:
+        assert classify(base_url) == expected
+
+
 @pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
 @pytest.mark.parametrize(("base_url", "expected"), [
     ("https://api.openai.com/v1", "openai"),
@@ -385,6 +418,53 @@ def test_windows_openai_provider_classifier_rejects_invalid_urls(base_url):
     assert proc.returncode != 0
     assert "openai-compatible" not in proc.stdout
     assert base_url not in proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+def test_windows_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + "\nGet-OpenAIProviderId $env:EASEL_TEST_BASE_URL"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        env={**os.environ, "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    if expected is None:
+        assert proc.returncode != 0
+        assert "openai-compatible" not in proc.stdout
+        assert base_url not in proc.stdout + proc.stderr
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+@needs_bash
+def test_posix_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
+    classifier = _slice(lines, "openai_provider_id() {", "}", keep_end=True)
+    script = f"PROJECT_ROOT={shlex.quote(str(PROJECT_ROOT))}\n{classifier}\n" \
+        'openai_provider_id "$EASEL_TEST_BASE_URL"'
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": os.environ["PATH"], "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    if expected is None:
+        assert proc.returncode != 0
+        assert "openai-compatible" not in proc.stdout
+        assert base_url not in proc.stdout + proc.stderr
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected
 
 
 def test_posix_setup_routes_openai_by_exact_base_url():

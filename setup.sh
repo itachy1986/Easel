@@ -438,53 +438,8 @@ usable_key() {
 }
 
 openai_provider_id() {
-    local normalized scheme rest authority host suffix port
-    normalized="$(printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    while [ "${normalized%/}" != "$normalized" ]; do
-        normalized="${normalized%/}"
-    done
-    if [ -z "$normalized" ] || [ "$normalized" = "https://api.openai.com/v1" ]; then
-        printf '%s' 'openai'
-        return 0
-    fi
-    case "$normalized" in
-        *[[:space:]]*|*'@'*) return 1 ;;
-        *://*) ;;
-        *) return 1 ;;
-    esac
-    scheme="$(printf '%s' "${normalized%%://*}" | tr '[:upper:]' '[:lower:]')"
-    case "$scheme" in
-        http|https) ;;
-        *) return 1 ;;
-    esac
-    rest="${normalized#*://}"
-    authority="${rest%%/*}"
-    authority="${authority%%\?*}"
-    authority="${authority%%\#*}"
-    [ -n "$authority" ] || return 1
-    case "$authority" in
-        \[*\]*)
-            host="${authority#\[}"
-            host="${host%%\]*}"
-            [ -n "$host" ] || return 1
-            suffix="${authority#*\]}"
-            ;;
-        *'['*|*']'*) return 1 ;;
-        *)
-            host="${authority%%:*}"
-            [ -n "$host" ] || return 1
-            suffix="${authority#"$host"}"
-            ;;
-    esac
-    case "$suffix" in
-        '') ;;
-        :*)
-            port="${suffix#:}"
-            case "$port" in ''|*[!0-9]*) return 1 ;; esac
-            ;;
-        *) return 1 ;;
-    esac
-    printf '%s' 'openai-compatible'
+    printf '%s' "${1:-}" |
+        python3 "$PROJECT_ROOT/scripts/migrate_openclaw_profile.py" --classify-openai-provider-stdin
 }
 
 MODEL_CONFIGURED=false

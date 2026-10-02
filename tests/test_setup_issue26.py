@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -102,8 +103,8 @@ def _openai_models_written(tmp_path: Path, **env: str) -> str:
     calls = tmp_path / "oc.log"
     script = textwrap.dedent(f"""
         set -u
-        PROJECT_ROOT={tmp_path}
-        CFG={calls}
+        PROJECT_ROOT={shlex.quote(str(PROJECT_ROOT))}
+        CFG={shlex.quote(str(calls))}
         : > "$CFG"
         ok()   {{ echo "OK|$*"; }}
         warn() {{ echo "WARN|$*"; }}
