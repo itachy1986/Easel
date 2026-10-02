@@ -520,19 +520,29 @@ fi
 if usable_key "${OPENAI_API_KEY:-}" && ! usable_key "${ANTHROPIC_API_KEY:-}" \
    && ! { usable_key "${EASEL_LLM_API_KEY:-}" && [ -n "${EASEL_LLM_BASE_URL:-}" ]; }; then
     OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o}"
+    OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+    OPENAI_BASE_NORMALIZED="$OPENAI_BASE_URL"
+    while [ "${OPENAI_BASE_NORMALIZED%/}" != "$OPENAI_BASE_NORMALIZED" ]; do
+        OPENAI_BASE_NORMALIZED="${OPENAI_BASE_NORMALIZED%/}"
+    done
+    if [ "$OPENAI_BASE_NORMALIZED" = "https://api.openai.com/v1" ]; then
+        OPENAI_PROVIDER="openai"
+    else
+        OPENAI_PROVIDER="openai-compatible"
+    fi
     # 未声明 maxTokens 时 OpenClaw 会自行推导，部分 OpenAI 兼容网关据此拒绝请求
     # （issue #26 P0-2）。默认值对齐默认模型 gpt-4o 的真实上限（128K 上下文 /
     # 16384 最大输出，OpenAI 官方文档），不是随手照抄 Gemini 分支的 65535 ——
     # 声称上限高于真实值，长输出请求照样会被下游网关拒；两个方向都可被 .env 覆盖。
     OPENAI_CONTEXT_WINDOW="${OPENAI_CONTEXT_WINDOW:-128000}"
     OPENAI_MAX_TOKENS="${OPENAI_MAX_TOKENS:-16384}"
-    $OC config set models.providers.openai.api "openai-completions" 2>&1 | sed '/^No change$/d'
-    $OC config set models.providers.openai.apiKey "$OPENAI_API_KEY" 2>&1 | sed '/^No change$/d'
-    $OC config set models.providers.openai.baseUrl "${OPENAI_BASE_URL:-https://api.openai.com/v1}" 2>&1 | sed '/^No change$/d'
-    $OC config set models.providers.openai.models \
+    $OC config set models.providers."$OPENAI_PROVIDER".api "openai-completions" 2>&1 | sed '/^No change$/d'
+    $OC config set models.providers."$OPENAI_PROVIDER".apiKey "$OPENAI_API_KEY" 2>&1 | sed '/^No change$/d'
+    $OC config set models.providers."$OPENAI_PROVIDER".baseUrl "$OPENAI_BASE_URL" 2>&1 | sed '/^No change$/d'
+    $OC config set models.providers."$OPENAI_PROVIDER".models \
         "[{\"id\":\"$OPENAI_MODEL\",\"name\":\"OpenAI model\",\"reasoning\":true,\"input\":[\"text\",\"image\"],\"contextWindow\":$OPENAI_CONTEXT_WINDOW,\"maxTokens\":$OPENAI_MAX_TOKENS}]" \
         --strict-json 2>&1 | sed '/^No change$/d'
-    DEFAULT_PRIMARY_MODEL="openai/$OPENAI_MODEL"
+    DEFAULT_PRIMARY_MODEL="$OPENAI_PROVIDER/$OPENAI_MODEL"
     CLAUDE_MODEL="$DEFAULT_PRIMARY_MODEL"
     ok "OpenAI 服务认证已同步"
 elif [ "$STANDARD_LLM_CONFIGURED" = false ] && usable_key "${OPENAI_MAAS_API_KEY:-}"; then

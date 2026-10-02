@@ -220,3 +220,126 @@ def test_choice_zero_remains_credential_blind_and_writes_no_provider_or_primary(
     assert "0) ;;" in sh_choice
     assert "models.providers" not in sh_choice
     assert "agents.defaults.model.primary" not in sh_choice
+
+
+@pytest.mark.parametrize(("base_url", "expected"), [
+    (None, "openai"),
+    ("", "openai"),
+    ("   ", "openai"),
+    ("https://api.openai.com/v1", "openai"),
+    ("https://api.openai.com/v1/", "openai"),
+    ("https://api.openai.com/v1//", "openai"),
+    ("https://api.openai.com/v1/chat/completions", "openai-compatible"),
+    ("https://api.deepseek.com/v1", "openai-compatible"),
+    ("https://proxy.example.com/openai/v1", "openai-compatible"),
+])
+def test_openai_provider_classification_is_exact(base_url, expected):
+    migrator = _load_migrator()
+
+    assert migrator.classify_openai_provider(base_url) == expected
+
+
+def test_custom_openai_provider_is_moved_deeply_and_primary_is_migrated(tmp_path):
+    config_path = tmp_path / "openclaw.json"
+    custom_provider = {
+        "baseUrl": "https://proxy.example.com/v1",
+        "api": "openai-completions",
+        "apiKey": "secret-api-key-sentinel",
+        "models": [{"id": "custom-model", "name": "Custom", "input": ["text"]}],
+        "headers": {"X-Tenant": "keep", "Authorization": "secret-header-sentinel"},
+        "request": {"allowPrivateNetwork": False, "nested": {"keep": True}},
+        "localService": {"command": "adapter", "env": {"TOKEN": "secret-local-sentinel"}},
+        "timeoutSeconds": 321,
+        "unknown": {"nested": [1, True, None]},
+    }
+    original = {
+        "models": {"providers": {
+            "openai": custom_provider,
+            "unrelated": {"baseUrl": "https://unrelated.example/v1", "models": [{"id": "u", "name": "U"}]},
+        }},
+        "agents": {"defaults": {"model": {"primary": "openai/custom-model"}}},
+        "media": {
+            "image": {"provider": "openai", "model": "image-model"},
+            "audio": {"provider": "openai", "model": "audio-model"},
+        },
+        "memory": {"search": {"provider": "openai-compatible", "model": "embedding-model"}},
+        "auth": {"opaque": "secret-auth-store-sentinel"},
+    }
+    config_path.write_text(json.dumps(original, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    proc = _run_migration(config_path)
+
+    assert proc.returncode == 0, proc.stderr
+    migrated = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "openai" not in migrated["models"]["providers"]
+    assert migrated["models"]["providers"]["openai-compatible"] == custom_provider
+    assert migrated["agents"]["defaults"]["model"]["primary"] == "openai-compatible/custom-model"
+    assert migrated["models"]["providers"]["unrelated"] == original["models"]["providers"]["unrelated"]
+    assert migrated["media"] == original["media"]
+    assert migrated["memory"] == original["memory"]
+    assert migrated["auth"] == original["auth"]
+    assert "secret-" not in proc.stdout + proc.stderr
+    assert len(_backups(config_path)) == 1
+
+
+def test_official_openai_provider_is_byte_identical_and_has_no_backup(tmp_path):
+    config_path = tmp_path / "openclaw.json"
+    original = b'{\n  "models": {"providers": {"openai": {"baseUrl": "https://api.openai.com/v1/", "unknown": true}}}\n}\n'
+    config_path.write_bytes(original)
+
+    proc = _run_migration(config_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert config_path.read_bytes() == original
+    assert _backups(config_path) == []
+
+
+def test_equivalent_target_collision_converges_and_is_idempotent(tmp_path):
+    config_path = tmp_path / "openclaw.json"
+    provider = {"baseUrl": "https://proxy.example/v1", "apiKey": "secret-sentinel", "models": []}
+    equivalent_target = copy.deepcopy(provider)
+    equivalent_target["baseUrl"] += "/"
+    config_path.write_text(json.dumps({
+        "models": {"providers": {"openai": provider, "openai-compatible": equivalent_target}},
+        "agents": {"defaults": {"model": {"primary": "openai/model-x"}}},
+    }), encoding="utf-8")
+
+    first = _run_migration(config_path)
+    first_bytes = config_path.read_bytes()
+    second = _run_migration(config_path)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    migrated = json.loads(first_bytes.decode("utf-8"))
+    assert "openai" not in migrated["models"]["providers"]
+    assert migrated["models"]["providers"]["openai-compatible"] == equivalent_target
+    assert migrated["agents"]["defaults"]["model"]["primary"] == "openai-compatible/model-x"
+    assert len(_backups(config_path)) == 1
+
+
+def test_non_equivalent_target_collision_fails_without_write_or_backup(tmp_path):
+    config_path = tmp_path / "openclaw.json"
+    original = json.dumps({
+        "models": {"providers": {
+            "openai": {"baseUrl": "https://proxy-a.example/v1", "apiKey": "secret-a"},
+            "openai-compatible": {"baseUrl": "https://proxy-b.example/v1", "apiKey": "secret-b"},
+        }},
+        "agents": {"defaults": {"model": {"primary": "openai/model-x"}}},
+    }).encode("utf-8")
+    config_path.write_bytes(original)
+
+    proc = _run_migration(config_path)
+
+    assert proc.returncode != 0
+    assert "collision" in proc.stderr.lower()
+    assert "secret-" not in proc.stdout + proc.stderr
+    assert config_path.read_bytes() == original
+    assert _backups(config_path) == []
+
+
+def test_migrator_does_not_access_oauth_or_auth_stores():
+    source = MIGRATOR.read_text(encoding="utf-8").lower()
+
+    assert "sqlite" not in source
+    assert "oauth" not in source
+    assert "token.json" not in source

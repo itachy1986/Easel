@@ -201,6 +201,11 @@ $envPath = Join-Path $Root '.env'
 if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $Root '.env.example') $envPath }
 $envValues = Read-EnvFile $envPath
 function Is-UsableKey($Value) { return -not [string]::IsNullOrWhiteSpace($Value) -and $Value -notmatch 'REPLACE_ME|your[-_ ]?api[-_ ]?key' }
+function Get-OpenAIProviderId($BaseUrl) {
+    $normalized = "$BaseUrl".Trim().TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized -ceq 'https://api.openai.com/v1') { return 'openai' }
+    return 'openai-compatible'
+}
 if (-not (Is-UsableKey $envValues['ANTHROPIC_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_API_KEY']) -and -not (Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN']) -and -not (Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_MAAS_API_KEY'])) {
     $choice = Read-Host '模型服务：1 Anthropic / 2 OpenAI-compatible / 0 稍后配置 [1]'
     if ($choice -eq '2') { $key = Read-Secret 'OpenAI API Key（不会回显）'; $url = Read-Host 'Base URL [https://api.openai.com/v1]'; $model = Read-Host '模型 [gpt-4o]'; Add-Content $envPath "`nOPENAI_API_KEY=$key`nOPENAI_BASE_URL=$url`nOPENAI_MODEL=$model" }
@@ -257,12 +262,14 @@ if ((Is-UsableKey $envValues['OPENAI_MAAS_API_KEY']) -and $envValues.ContainsKey
     OpenClaw-Config 'agents.defaults.model.primary' "rednote-openai/$model"
 } elseif (Is-UsableKey $envValues['OPENAI_API_KEY']) {
     $model = if ($envValues.ContainsKey('OPENAI_MODEL')) { $envValues['OPENAI_MODEL'] } else { 'gpt-4o' }
+    $openaiBaseUrl = if ($envValues.ContainsKey('OPENAI_BASE_URL')) { $envValues['OPENAI_BASE_URL'] } else { 'https://api.openai.com/v1' }
+    $openaiProvider = Get-OpenAIProviderId $openaiBaseUrl
     OpenClaw-ConfigBatch @(
-        @{ path = 'models.providers.openai.api'; value = 'openai-completions' },
-        @{ path = 'models.providers.openai.apiKey'; value = $envValues['OPENAI_API_KEY'] },
-        @{ path = 'models.providers.openai.baseUrl'; value = $(if ($envValues.ContainsKey('OPENAI_BASE_URL')) { $envValues['OPENAI_BASE_URL'] } else { 'https://api.openai.com/v1' }) },
-        @{ path = 'models.providers.openai.models'; value = @(@{ id = $model; name = 'OpenAI model'; reasoning = $true; input = @('text', 'image') }) },
-        @{ path = 'agents.defaults.model.primary'; value = "openai/$model" }
+        @{ path = "models.providers.$openaiProvider.api"; value = 'openai-completions' },
+        @{ path = "models.providers.$openaiProvider.apiKey"; value = $envValues['OPENAI_API_KEY'] },
+        @{ path = "models.providers.$openaiProvider.baseUrl"; value = $openaiBaseUrl },
+        @{ path = "models.providers.$openaiProvider.models"; value = @(@{ id = $model; name = 'OpenAI model'; reasoning = $true; input = @('text', 'image') }) },
+        @{ path = 'agents.defaults.model.primary'; value = "$openaiProvider/$model" }
     )
 } elseif ((Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and $envValues.ContainsKey('EASEL_LLM_BASE_URL')) {
     # 原子写入整块 provider（含 header 与 anthropic-version）；整块替换会顺带清掉旧的专用 header。

@@ -119,7 +119,7 @@ def _openai_models_written(tmp_path: Path, **env: str) -> str:
                           timeout=60, env={"PATH": os.environ["PATH"], **env})
     assert proc.returncode == 0, f"OpenAI 分支执行失败：{proc.stderr}"
     for line in calls.read_text(encoding="utf-8").splitlines():
-        if line.startswith("models.providers.openai.models = "):
+        if line.startswith("models.providers.openai-compatible.models = "):
             return line.split(" = ", 1)[1]
     return ""
 

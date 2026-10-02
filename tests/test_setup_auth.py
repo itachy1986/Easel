@@ -21,6 +21,7 @@ import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -31,6 +32,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SH = PROJECT_ROOT / "setup.sh"
 SETUP_PS1 = PROJECT_ROOT / "setup.ps1"
+PWSH = shutil.which("pwsh") or shutil.which("powershell")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from easel.commands import doctor  # noqa: E402
@@ -119,9 +121,10 @@ DEEPSEEK = {
 def test_placeholder_does_not_block_openai_branch(tmp_path):
     """核心回归：占位符没删 + 配了 OpenAI 兼容服务 → provider 必须真的写出来。"""
     out, written = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
-    assert written.get("models.providers.openai.apiKey") == "sk-deepseek-fake"
-    assert written.get("models.providers.openai.baseUrl") == "https://api.deepseek.com/v1"
-    assert written.get("agents.defaults.model.primary") == "openai/deepseek-chat"
+    assert written.get("models.providers.openai-compatible.apiKey") == "sk-deepseek-fake"
+    assert written.get("models.providers.openai-compatible.baseUrl") == "https://api.deepseek.com/v1"
+    assert written.get("agents.defaults.model.primary") == "openai-compatible/deepseek-chat"
+    assert not any(k.startswith("models.providers.openai.") for k in written)
     assert "WARN|认证未配置" not in out
 
 
@@ -131,6 +134,20 @@ def test_placeholder_present_or_absent_gives_same_result(tmp_path):
     _, with_ph = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
     _, without = _run_auth(tmp_path, **DEEPSEEK)
     assert with_ph == without
+
+
+@needs_bash
+def test_official_openai_base_uses_canonical_provider(tmp_path):
+    _, written = _run_auth(
+        tmp_path,
+        OPENAI_API_KEY="sk-official-fake",
+        OPENAI_BASE_URL="https://api.openai.com/v1/",
+        OPENAI_MODEL="gpt-4o-mini",
+    )
+
+    assert written.get("models.providers.openai.baseUrl") == "https://api.openai.com/v1/"
+    assert written.get("agents.defaults.model.primary") == "openai/gpt-4o-mini"
+    assert not any(k.startswith("models.providers.openai-compatible.") for k in written)
 
 
 @needs_bash
@@ -272,6 +289,57 @@ def test_ps1_auth_branches_guard_base_url():
         pattern = rf"\(\(Is-UsableKey \$envValues\['{key}'\]\) -and " \
                   rf"\$envValues\.ContainsKey\('{companion}'\)\)"
         assert re.search(pattern, text), f"{key} 分支缺少括号化的 {companion} 守卫"
+
+
+def test_windows_setup_routes_custom_openai_to_compatible_namespace():
+    text = SETUP_PS1.read_text(encoding="utf-8")
+
+    assert "function Get-OpenAIProviderId" in text
+    assert "models.providers.$openaiProvider.api" in text
+    assert '"$openaiProvider/$model"' in text
+
+
+def _ps_openai_classifier_source() -> str:
+    lines = SETUP_PS1.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("function Get-OpenAIProviderId"))
+    depth = 0
+    selected = []
+    for line in lines[start:]:
+        selected.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            break
+    return "\n".join(selected)
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize(("base_url", "expected"), [
+    ("https://api.openai.com/v1", "openai"),
+    ("https://api.openai.com/v1/", "openai"),
+    ("https://proxy.example.com/v1", "openai-compatible"),
+])
+def test_windows_openai_provider_classifier(base_url, expected):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + f"\nGet-OpenAIProviderId '{base_url}'"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected
+
+
+def test_posix_setup_routes_openai_by_exact_base_url():
+    text = SETUP_SH.read_text(encoding="utf-8")
+
+    assert 'OPENAI_PROVIDER="openai-compatible"' in text
+    assert 'OPENAI_PROVIDER="openai"' in text
+    assert 'models.providers."$OPENAI_PROVIDER".api' in text
+    assert 'DEFAULT_PRIMARY_MODEL="$OPENAI_PROVIDER/$OPENAI_MODEL"' in text
 
 
 # ── install_tool：别展开、别降级用户 PATH ──────────────────────────────
