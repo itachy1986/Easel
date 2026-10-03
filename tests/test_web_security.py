@@ -187,12 +187,18 @@ def test_local_gateway_helper():
 @pytest.mark.parametrize("bad", [
     "http://u:p@evil.example.com/v1",
     "ftp://evil.example.com",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
     "https://api.openai.com/v1\tx",
     "javascript:alert(1)",
 ])
 def test_base_url_validated_whole_string(client, bad):
-    _assert_blocked(client, {"channel": "chat",
-                             "rows": [{"slot": "openai", "baseUrl": bad, "key": "sk-new"}]})
+    resp = _save(client, {"channel": "chat",
+                          "rows": [{"slot": "openai", "baseUrl": bad, "key": "sk-new"}]})
+
+    assert resp.status_code == 400
+    assert client.env_file.read_text(encoding="utf-8") == ORIGINAL_ENV, ".env 被改动了"
 
 
 @pytest.mark.parametrize("url,ok", [
@@ -263,6 +269,46 @@ def test_legit_save_still_works(client):
     assert env["OPENAI_BASE_URL"] == "https://new.example.com/v1"
     assert env["OPENAI_API_KEY"] == "sk-fresh"
 
+    data = json.loads(client.openclaw_cfg.read_text(encoding="utf-8"))
+    assert data["models"]["providers"]["openai"]["baseUrl"] == "https://api.openai.com/v1"
+    assert data["models"]["providers"]["openai-compatible"]["baseUrl"] == "https://new.example.com/v1"
+    assert data["models"]["providers"]["openai-compatible"]["api"] == "openai-completions"
+
+
+def test_official_openai_save_stays_in_canonical_namespace(client):
+    resp = _save(client, {"channel": "chat", "rows": [
+        {"slot": "openai", "model": "gpt-4o-mini",
+         "baseUrl": "https://api.openai.com/v1/", "key": "sk-fresh", "primary": True}]})
+
+    assert resp.status_code == 200, resp.text[:300]
+    data = json.loads(client.openclaw_cfg.read_text(encoding="utf-8"))
+    assert data["models"]["providers"]["openai"]["models"][0]["id"] == "gpt-4o-mini"
+    assert "openai-compatible" not in data["models"]["providers"]
+    assert data["agents"]["defaults"]["model"]["primary"] == "openai/gpt-4o-mini"
+
+
+def test_compatible_provider_listing_uses_reserved_openai_slot(client):
+    client.env_file.write_text("", encoding="utf-8")
+    client.openclaw_cfg.write_text(json.dumps({
+        "models": {"providers": {"openai-compatible": {
+            "api": "openai-completions",
+            "apiKey": "sk-fake-compatible",
+            "baseUrl": "https://proxy.example.com/v1",
+            "models": [{"id": "proxy-model", "name": "Proxy model"}],
+        }}},
+        "agents": {"defaults": {"model": {"primary": "openai-compatible/proxy-model"}}},
+    }), encoding="utf-8")
+
+    resp = client.get("/api/settings/models")
+
+    assert resp.status_code == 200, resp.text[:300]
+    rows = resp.json()["channels"]["chat"]["rows"]
+    compatible = [row for row in rows if row.get("slot") == "openai"]
+    assert len(compatible) == 1
+    assert compatible[0]["name"] == "openai-compatible"
+    assert compatible[0]["model"] == "proxy-model"
+    assert compatible[0]["role"] == "主"
+
 
 def test_model_only_change_not_blocked(client):
     """地址没变、只改模型（Key 留空）是日常操作，不能被换址规则误伤。"""
@@ -286,7 +332,8 @@ def test_save_never_writes_real_openclaw_config(client):
          "baseUrl": "https://api.deepseek.com", "key": "sk-fake-new"}]})
     assert resp.status_code == 200, resp.text[:300]
     data = json.loads(client.openclaw_cfg.read_text(encoding="utf-8"))
-    assert data["models"]["providers"]["openai"]["models"][0]["id"] == "deepseek-flash"
+    assert data["models"]["providers"]["openai-compatible"]["models"][0]["id"] == "deepseek-flash"
+    assert data["models"]["providers"]["openai"]["models"][0]["id"] == "gpt-4o"
 
 
 # ---- #48 传输层：直连常驻网关提速，但绝不能把会话历史搞丢 ----

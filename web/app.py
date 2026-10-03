@@ -43,6 +43,7 @@ from easel.gateway_endpoint import chat_completions_url, healthz_url, port_sourc
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
+from migrate_openclaw_profile import classify_openai_provider
 try:
     from easel.gateway_questions import (
         GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
@@ -761,13 +762,13 @@ _SLOT_ENV_KEYS = {
 
 def _valid_base_url(u: str) -> bool:
     '整串校验（不是只看开头）：必须是 http(s)://host，且不带控制字符与 URL 内嵌凭据。'
-    if any(c in u for c in '\r\n\t\x00') or '@' in u:
+    if not isinstance(u, str) or not u.strip():
         return False
     try:
-        p = urllib.parse.urlparse(u)
-    except ValueError:
+        classify_openai_provider(u)
+    except (TypeError, ValueError):
         return False
-    return p.scheme in ('http', 'https') and bool(p.hostname)
+    return True
 
 
 def _ssrf_safe(u: str) -> bool:
@@ -1288,26 +1289,47 @@ def _mask_key(v: str) -> str:
 def _model_channels() -> dict:
     env = _read_env()
     primary = ""
+    provs: dict = {}
     try:
         oc = _oc_config_path()
         if oc.is_file():
-            primary = str(json.loads(oc.read_text(encoding="utf-8"))
-                          .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
+            data = json.loads(oc.read_text(encoding="utf-8"))
+            primary = str(data.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
+            configured = data.get("models", {}).get("providers", {})
+            if isinstance(configured, dict):
+                provs = configured
     except Exception:  # noqa: BLE001
         pass
 
     chat_rows = []
     ob = (env.get("OPENAI_BASE_URL") or "").strip()
-    om = (env.get("OPENAI_MODEL") or "").strip()
-    ok_key = bool((env.get("OPENAI_API_KEY") or "").strip())
-    if ob or ok_key:
+    env_openai_key = (env.get("OPENAI_API_KEY") or "").strip()
+    if ob:
+        openai_provider = classify_openai_provider(ob)
+    elif primary.startswith("openai-compatible/") or (
+        "openai-compatible" in provs and "openai" not in provs
+    ):
+        openai_provider = "openai-compatible"
+    else:
+        openai_provider = "openai"
+    openai_config = provs.get(openai_provider)
+    if not isinstance(openai_config, dict):
+        openai_config = {}
+    configured_models = openai_config.get("models")
+    configured_model = ""
+    if isinstance(configured_models, list) and configured_models and isinstance(configured_models[0], dict):
+        configured_model = str(configured_models[0].get("id") or "").strip()
+    om = (env.get("OPENAI_MODEL") or "").strip() or configured_model
+    openai_key = env_openai_key or str(openai_config.get("apiKey") or "").strip()
+    openai_base = ob or str(openai_config.get("baseUrl") or "").strip()
+    if openai_base or openai_key or openai_config:
         chat_rows.append({
-            "slot": "openai", "order": 1, "name": "deepseek",
-            "sub": "官方直连",
+            "slot": "openai", "order": 1, "name": openai_provider,
+            "sub": "官方直连" if openai_provider == "openai" else "OpenAI-compatible",
             "type": "openai", "model": om or "deepseek-chat",
-            "baseUrl": ob, "keyMasked": _mask_key(env.get("OPENAI_API_KEY", "")),
-            "role": "主" if primary.startswith("openai/") else "备",
-            "result": "已配置" if ok_key else "缺 key",
+            "baseUrl": openai_base, "keyMasked": _mask_key(openai_key),
+            "role": "主" if primary.startswith(f"{openai_provider}/") else "备",
+            "result": "已配置" if openai_key else "缺 key",
         })
     ab = (env.get("ANTHROPIC_BASE_URL") or "").strip()
     ak = (env.get("ANTHROPIC_API_KEY") or "").strip()
@@ -1329,26 +1351,19 @@ def _model_channels() -> dict:
         })
 
     custom_rows = []
-    try:
-        oc = _oc_config_path()
-        if oc.is_file():
-            provs = (json.loads(oc.read_text(encoding="utf-8"))
-                     .get("models", {}).get("providers", {})) or {}
-            for pkey, pv in provs.items():
-                if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
-                    continue
-                models = pv.get("models") if isinstance(pv.get("models"), list) else []
-                mid = models[0].get("id", "") if models and isinstance(models[0], dict) else ""
-                custom_rows.append({
-                    "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
-                    "type": "openai", "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
-                    "keyMasked": _mask_key(str(pv.get("apiKey") or "")),
-                    "role": "主" if primary == f"{pkey}/{mid}" else "备",
-                    "result": "已配置" if str(pv.get("apiKey") or "").strip() else "缺 key",
-                    "deletable": True,
-                })
-    except Exception:  # noqa: BLE001
-        pass
+    for pkey, pv in provs.items():
+        if pkey in ("openai", "openai-compatible", "anthropic", "relay") or not isinstance(pv, dict):
+            continue
+        models = pv.get("models") if isinstance(pv.get("models"), list) else []
+        mid = models[0].get("id", "") if models and isinstance(models[0], dict) else ""
+        custom_rows.append({
+            "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
+            "type": "openai", "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
+            "keyMasked": _mask_key(str(pv.get("apiKey") or "")),
+            "role": "主" if primary == f"{pkey}/{mid}" else "备",
+            "result": "已配置" if str(pv.get("apiKey") or "").strip() else "缺 key",
+            "deletable": True,
+        })
     chat_rows.extend(custom_rows)
 
     sf = bool((env.get("SILICONFLOW_API_KEY") or "").strip())
@@ -1443,7 +1458,7 @@ def _write_env_direct(updates: dict[str, str]) -> None:
     tmp.replace(ENV_FILE)
 
 
-RESERVED_PROVIDER_KEYS = {"openai", "anthropic", "relay"}
+RESERVED_PROVIDER_KEYS = {"openai", "openai-compatible", "anthropic", "relay"}
 
 
 def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
@@ -1477,6 +1492,9 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         for pkey, vals in provider_updates.items():
             prov = providers.setdefault(pkey, {})
             base, key, model = vals.get('base', ''), vals.get('key', ''), vals.get('model', '')
+            if pkey in {'openai', 'openai-compatible'} and not prov.get('api'):
+                prov['api'] = 'openai-completions'
+                changed = True
             if base and prov.get('baseUrl') != base:
                 if _is_local_gateway_base(prov.get('baseUrl')):
                     pass  # 本地模型网关模式：保留网关地址（真实上游在 easel-models.yaml），勿改回直连
@@ -1648,8 +1666,8 @@ async def api_settings_models_save(req: ModelSaveRequest):
             if key:
                 updates['OPENAI_API_KEY'] = key
             if is_chat:
-                provider_updates['openai'] = {'model': model, 'base': base, 'key': key}
-                pkey = 'openai'
+                pkey = classify_openai_provider(base or _cur_env.get('OPENAI_BASE_URL', ''))
+                provider_updates[pkey] = {'model': model, 'base': base, 'key': key}
         elif slot == 'relay':
             if base:
                 updates['EASEL_LLM_BASE_URL'] = base

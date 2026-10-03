@@ -18,9 +18,12 @@ $OC 换成记录器，所以测的是真代码、不是复制品。
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -31,9 +34,30 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SH = PROJECT_ROOT / "setup.sh"
 SETUP_PS1 = PROJECT_ROOT / "setup.ps1"
+MIGRATOR = PROJECT_ROOT / "scripts" / "migrate_openclaw_profile.py"
+PWSH = shutil.which("pwsh") or shutil.which("powershell")
+
+OPENAI_BASE_URL_MATRIX = [
+    ("http://localhost/v1", "openai-compatible"),
+    ("http://localhost:0/v1", "openai-compatible"),
+    ("http://localhost:65535/v1", "openai-compatible"),
+    ("http://localhost:99999/v1", None),
+    ("http://localhost:-1/v1", None),
+    ("http://[::1]:8080/v1", "openai-compatible"),
+    ("http://[not-ipv6]:8080/v1", None),
+    ("http://user:credential@example.com/v1", None),
+]
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from easel.commands import doctor  # noqa: E402
+
+
+def _load_migrator():
+    spec = importlib.util.spec_from_file_location("easel_profile_migrator_for_setup", MIGRATOR)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ── setup.sh：把真代码切出来在沙箱里跑 ────────────────────────────────
@@ -69,18 +93,20 @@ def _slice(lines: list[str], start: str, end: str, *, keep_end: bool) -> str:
 def _auth_block() -> str:
     lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
     helper = _slice(lines, "usable_key() {", "}", keep_end=True)
+    classifier = _slice(lines, "openai_provider_id() {", "}", keep_end=True)
     body = _slice(lines, 'DEFAULT_PRIMARY_MODEL="anthropic',
                   "# 整个 agent run 的总时长上限", keep_end=False)
-    return helper + "\n\n" + body
+    return helper + "\n\n" + classifier + "\n\n" + body
 
 
-def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
-    """跑认证段，返回 (stdout, 实际写进 openclaw 的配置)。"""
+def _run_auth_process(
+    tmp_path: Path, **env: str
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     calls = tmp_path / "oc-calls.log"
     script = textwrap.dedent(f"""
         set -u
-        PROJECT_ROOT={tmp_path}
-        CFG={calls}
+        PROJECT_ROOT={shlex.quote(str(PROJECT_ROOT))}
+        CFG={shlex.quote(str(calls))}
         : > "$CFG"
         ok()   {{ echo "OK|$*"; }}
         warn() {{ echo "WARN|$*"; }}
@@ -96,13 +122,19 @@ def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
 
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           timeout=60, env={"PATH": os.environ["PATH"], **env})
-    assert proc.returncode == 0, f"认证段执行失败：{proc.stderr}"
     written: dict[str, str] = {}
     if calls.is_file():
         for line in calls.read_text(encoding="utf-8").splitlines():
             if " = " in line:
                 k, v = line.split(" = ", 1)
                 written[k] = v
+    return proc, written
+
+
+def _run_auth(tmp_path: Path, **env: str) -> tuple[str, dict[str, str]]:
+    """跑认证段，返回 (stdout, 实际写进 openclaw 的配置)。"""
+    proc, written = _run_auth_process(tmp_path, **env)
+    assert proc.returncode == 0, f"认证段执行失败：{proc.stderr}"
     return proc.stdout, written
 
 
@@ -119,9 +151,10 @@ DEEPSEEK = {
 def test_placeholder_does_not_block_openai_branch(tmp_path):
     """核心回归：占位符没删 + 配了 OpenAI 兼容服务 → provider 必须真的写出来。"""
     out, written = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
-    assert written.get("models.providers.openai.apiKey") == "sk-deepseek-fake"
-    assert written.get("models.providers.openai.baseUrl") == "https://api.deepseek.com/v1"
-    assert written.get("agents.defaults.model.primary") == "openai/deepseek-chat"
+    assert written.get("models.providers.openai-compatible.apiKey") == "sk-deepseek-fake"
+    assert written.get("models.providers.openai-compatible.baseUrl") == "https://api.deepseek.com/v1"
+    assert written.get("agents.defaults.model.primary") == "openai-compatible/deepseek-chat"
+    assert not any(k.startswith("models.providers.openai.") for k in written)
     assert "WARN|认证未配置" not in out
 
 
@@ -131,6 +164,42 @@ def test_placeholder_present_or_absent_gives_same_result(tmp_path):
     _, with_ph = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
     _, without = _run_auth(tmp_path, **DEEPSEEK)
     assert with_ph == without
+
+
+@needs_bash
+def test_official_openai_base_uses_canonical_provider(tmp_path):
+    _, written = _run_auth(
+        tmp_path,
+        OPENAI_API_KEY="sk-official-fake",
+        OPENAI_BASE_URL="https://api.openai.com/v1/",
+        OPENAI_MODEL="gpt-4o-mini",
+    )
+
+    assert written.get("models.providers.openai.baseUrl") == "https://api.openai.com/v1/"
+    assert written.get("agents.defaults.model.primary") == "openai/gpt-4o-mini"
+    assert not any(k.startswith("models.providers.openai-compatible.") for k in written)
+
+
+@pytest.mark.parametrize("bad_base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///tmp/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+@needs_bash
+def test_invalid_openai_base_fails_before_posix_config_mutation(tmp_path, bad_base_url):
+    proc, written = _run_auth_process(
+        tmp_path,
+        OPENAI_API_KEY="sk-invalid-base-sentinel",
+        OPENAI_BASE_URL=bad_base_url,
+        OPENAI_MODEL="model-x",
+    )
+
+    assert proc.returncode != 0
+    assert written == {}
+    assert "OPENAI_BASE_URL" in proc.stderr
+    assert bad_base_url not in proc.stdout + proc.stderr
+    assert "sk-invalid-base-sentinel" not in proc.stdout + proc.stderr
 
 
 @needs_bash
@@ -272,6 +341,139 @@ def test_ps1_auth_branches_guard_base_url():
         pattern = rf"\(\(Is-UsableKey \$envValues\['{key}'\]\) -and " \
                   rf"\$envValues\.ContainsKey\('{companion}'\)\)"
         assert re.search(pattern, text), f"{key} 分支缺少括号化的 {companion} 守卫"
+
+
+def test_windows_setup_routes_custom_openai_to_compatible_namespace():
+    text = SETUP_PS1.read_text(encoding="utf-8")
+
+    assert "function Get-OpenAIProviderId" in text
+    assert "models.providers.$openaiProvider.api" in text
+    assert '"$openaiProvider/$model"' in text
+
+
+def _ps_openai_classifier_source() -> str:
+    lines = SETUP_PS1.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("function Get-OpenAIProviderId"))
+    depth = 0
+    selected = []
+    for line in lines[start:]:
+        selected.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            break
+    return "\n".join(selected)
+
+
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+def test_python_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    classify = _load_migrator().classify_openai_provider
+
+    if expected is None:
+        with pytest.raises(ValueError, match="Base URL"):
+            classify(base_url)
+    else:
+        assert classify(base_url) == expected
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize(("base_url", "expected"), [
+    ("https://api.openai.com/v1", "openai"),
+    ("https://api.openai.com/v1/", "openai"),
+    ("https://proxy.example.com/v1", "openai-compatible"),
+])
+def test_windows_openai_provider_classifier(base_url, expected):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + f"\nGet-OpenAIProviderId '{base_url}'"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize("base_url", [
+    "ftp://proxy.example.com/v1",
+    "file:///C:/openai.sock",
+    "not-a-url",
+    "https:///v1",
+])
+def test_windows_openai_provider_classifier_rejects_invalid_urls(base_url):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + "\nGet-OpenAIProviderId $env:EASEL_TEST_BASE_URL"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        env={**os.environ, "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    assert proc.returncode != 0
+    assert "openai-compatible" not in proc.stdout
+    assert base_url not in proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(not PWSH, reason="需要 PowerShell 验证 Windows setup 分类")
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+def test_windows_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    proc = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command",
+         _ps_openai_classifier_source() + "\nGet-OpenAIProviderId $env:EASEL_TEST_BASE_URL"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        env={**os.environ, "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    if expected is None:
+        assert proc.returncode != 0
+        assert "openai-compatible" not in proc.stdout
+        assert base_url not in proc.stdout + proc.stderr
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(("base_url", "expected"), OPENAI_BASE_URL_MATRIX)
+@needs_bash
+def test_posix_openai_provider_classifier_matches_cross_platform_matrix(base_url, expected):
+    lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
+    classifier = _slice(lines, "openai_provider_id() {", "}", keep_end=True)
+    script = f"PROJECT_ROOT={shlex.quote(str(PROJECT_ROOT))}\n{classifier}\n" \
+        'openai_provider_id "$EASEL_TEST_BASE_URL"'
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": os.environ["PATH"], "EASEL_TEST_BASE_URL": base_url},
+    )
+
+    if expected is None:
+        assert proc.returncode != 0
+        assert "openai-compatible" not in proc.stdout
+        assert base_url not in proc.stdout + proc.stderr
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected
+
+
+def test_posix_setup_routes_openai_by_exact_base_url():
+    text = SETUP_SH.read_text(encoding="utf-8")
+
+    assert "openai_provider_id() {" in text
+    assert 'OPENAI_PROVIDER="$(openai_provider_id "$OPENAI_BASE_URL")"' in text
+    assert 'models.providers."$OPENAI_PROVIDER".api' in text
+    assert 'DEFAULT_PRIMARY_MODEL="$OPENAI_PROVIDER/$OPENAI_MODEL"' in text
 
 
 # ── install_tool：别展开、别降级用户 PATH ──────────────────────────────
