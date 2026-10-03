@@ -871,3 +871,99 @@ export function fetchAvailableModels(
     body: JSON.stringify({ baseUrl, key, protocol, slot }),
   });
 }
+
+// ═══ Settings · OpenClaw-managed ChatGPT Plan ═══
+
+export type OpenAIPlanAuthMethod = 'siwc' | 'oauth' | 'device-code' | 'unknown';
+export type OpenAIPlanBillingSource = 'chatgpt_plan' | 'platform_api' | 'mixed' | 'unknown';
+export type OpenAIPlanJobState = 'running' | 'interaction_required' | 'success' | 'fail' | 'cancelled';
+export type OpenAIPlanCatalogState = 'available' | 'empty' | 'stale' | 'unavailable';
+
+export interface OpenAIPlanProfile {
+  handle: string;
+  displayLabel: string;
+  authMethod: OpenAIPlanAuthMethod;
+  usable: boolean;
+}
+
+export interface OpenAIPlanStatus {
+  available: boolean;
+  connected: boolean;
+  usable: boolean;
+  reauthRequired: boolean;
+  authMethod: OpenAIPlanAuthMethod;
+  billingSource: OpenAIPlanBillingSource;
+  activeProfileHandle: string;
+  displayLabel: string;
+  selectedModel: string;
+  runtimeStatus: string;
+  errorCode: string;
+  recoveryAction: string;
+  deviceCodeWebSupported: boolean;
+  profiles: OpenAIPlanProfile[];
+}
+
+export interface OpenAIPlanJob {
+  jobId: string;
+  state: OpenAIPlanJobState;
+  method: OpenAIPlanAuthMethod;
+  message: string;
+  errorCode: string;
+  deviceCodeWebSupported?: boolean;
+}
+
+export interface OpenAIPlanModel {
+  provider: 'openai';
+  ref: string;
+  id: string;
+  name: string;
+  displayName: string;
+  availability: 'available' | 'unavailable';
+}
+
+export interface OpenAIPlanCatalog {
+  status: OpenAIPlanCatalogState;
+  models: OpenAIPlanModel[];
+  errorCode: string;
+}
+
+export interface OpenAIPlanTestUseResult {
+  ok: boolean;
+  selectedModel: string;
+  effectiveProvider: string;
+  testResult: string;
+  errorCode: string;
+  credentialProof?: string;
+}
+
+export function fetchOpenAIPlanStatus(): Promise<OpenAIPlanStatus> {
+  return request('/api/settings/openai-plan/status');
+}
+
+export function connectOpenAIPlan(method: 'siwc' | 'oauth' | 'device-code'): Promise<OpenAIPlanJob> {
+  return request('/api/settings/openai-plan/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method }),
+  });
+}
+
+export function fetchOpenAIPlanJob(jobId: string): Promise<OpenAIPlanJob> {
+  return request(`/api/settings/openai-plan/job/${encodeURIComponent(jobId)}`);
+}
+
+export function cancelOpenAIPlanJob(jobId: string): Promise<OpenAIPlanJob> {
+  return request(`/api/settings/openai-plan/job/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+}
+
+export function fetchOpenAIPlanModels(): Promise<OpenAIPlanCatalog> {
+  return request('/api/settings/openai-plan/models');
+}
+
+export function testAndUseOpenAIPlan(profileHandle: string, model: string): Promise<OpenAIPlanTestUseResult> {
+  return request('/api/settings/openai-plan/test-use', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileHandle, model }),
+  });
+}
