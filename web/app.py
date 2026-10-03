@@ -41,6 +41,12 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
 
 from easel.gateway_endpoint import chat_completions_url, healthz_url, port_source
 from easel.openclaw_cmd import openclaw_base_cmd
+from easel.openai_plan_auth import (
+    ActiveJobError,
+    InvalidRequestError as OpenAIPlanInvalidRequest,
+    JobNotFoundError,
+    OpenAIPlanAuthFacade,
+)
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from migrate_openclaw_profile import classify_openai_provider
@@ -76,6 +82,10 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
+OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
+    profile=OPENCLAW_PROFILE,
+    cwd=PROJECT_ROOT,
+)
 # 对话传输层：http＝直连常驻 gateway 的 OpenAI 兼容端点，agent 在 gateway 进程里直接跑，
 # 省掉每轮 spawn `openclaw agent` 瘦客户端的冷启动（本机实测同一句话：CLI 7.1-7.6s/轮，
 # HTTP 4.1-4.5s/轮，差值就是客户端冷启动）；cli＝每轮 spawn 的老路径。
@@ -422,8 +432,9 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
+    """应用生命周期：关机时回收所有后台认证/扫码子进程。"""
     yield
+    OPENAI_PLAN_AUTH.shutdown()
     _stop_mp_login_on_shutdown()
 
 
@@ -1576,6 +1587,67 @@ class ModelSaveRow(BaseModel):
 class ModelSaveRequest(BaseModel):
     channel: str = "chat"
     rows: list[ModelSaveRow] = Field(default_factory=list)
+
+
+class OpenAIPlanConnectRequest(BaseModel):
+    method: str
+
+
+class OpenAIPlanTestUseRequest(BaseModel):
+    profileId: str
+    model: str
+
+
+@app.get("/api/settings/openai-plan/status")
+async def api_openai_plan_status():
+    """Return the allowlisted OpenClaw-managed OpenAI plan status."""
+    return await asyncio.to_thread(OPENAI_PLAN_AUTH.status)
+
+
+@app.post("/api/settings/openai-plan/connect")
+async def api_openai_plan_connect(req: OpenAIPlanConnectRequest):
+    """Start one non-blocking OpenClaw auth mutation job."""
+    try:
+        return OPENAI_PLAN_AUTH.start_connect(req.method)
+    except OpenAIPlanInvalidRequest:
+        raise HTTPException(400, "不支持的 OpenAI 登录方式") from None
+    except ActiveJobError:
+        raise HTTPException(409, "已有 OpenAI 登录任务正在运行") from None
+
+
+@app.get("/api/settings/openai-plan/job/{job_id}")
+async def api_openai_plan_job(job_id: str):
+    try:
+        return OPENAI_PLAN_AUTH.get_job(job_id)
+    except JobNotFoundError:
+        raise HTTPException(404, "任务不存在（服务可能重启过）") from None
+
+
+@app.post("/api/settings/openai-plan/job/{job_id}/cancel")
+async def api_openai_plan_cancel_job(job_id: str):
+    try:
+        return OPENAI_PLAN_AUTH.cancel_job(job_id)
+    except JobNotFoundError:
+        raise HTTPException(404, "任务不存在（服务可能重启过）") from None
+
+
+@app.get("/api/settings/openai-plan/models")
+async def api_openai_plan_models():
+    """Return the current account-aware, OpenAI-only model catalog."""
+    return await asyncio.to_thread(OPENAI_PLAN_AUTH.models)
+
+
+@app.post("/api/settings/openai-plan/test-use")
+async def api_openai_plan_test_use(req: OpenAIPlanTestUseRequest):
+    """Activate a current plan profile, prove the exact model, then persist it."""
+    try:
+        return await asyncio.to_thread(
+            OPENAI_PLAN_AUTH.test_and_use,
+            req.profileId,
+            req.model,
+        )
+    except OpenAIPlanInvalidRequest:
+        raise HTTPException(400, "Profile 或模型已失效，请刷新后重试") from None
 
 
 @app.post("/api/settings/models/save")
