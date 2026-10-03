@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -25,6 +26,7 @@ from easel.openclaw_cmd import openclaw_base_cmd
 _ALLOWED_METHODS = frozenset({"siwc", "oauth", "device-code"})
 _PLAN_PROFILE_TYPE = "oauth"
 _PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,127}$")
+_PUBLIC_HANDLE_RE = re.compile(r"^plan_[0-9a-f]{32}$")
 _MODEL_REF_RE = re.compile(r"^openai/([A-Za-z0-9][A-Za-z0-9._:+\-]{0,127})$")
 _FINAL_JOB_STATES = frozenset({"interaction_required", "success", "fail", "cancelled"})
 _TEST_PROMPT = "Reply with exactly OK."
@@ -177,6 +179,19 @@ def _safe_profile_id(value: Any) -> str:
     return text if _PROFILE_ID_RE.fullmatch(text) else ""
 
 
+def _safe_display_label(value: Any) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    if (
+        not text
+        or len(text) > 64
+        or "@" in text
+        or any(ch < " " or ch == "\x7f" for ch in text)
+        or not all(ch.isalnum() or ch.isspace() or ch in "._()+-" for ch in text)
+    ):
+        return "OpenAI plan"
+    return text
+
+
 def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
     rows = payload.get("profiles") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
@@ -203,11 +218,63 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
             {
                 "id": profile_id,
                 "method": method,
-                "label": _safe_text(row.get("label") or row.get("displayName")),
+                # OpenClaw's synthesized label can contain profileId/email.
+                # Only an explicit, allowlisted displayName is public-safe.
+                "display_label": _safe_display_label(row.get("displayName")),
                 "unusable": unusable,
             }
         )
     return normalized
+
+
+def _profile_snapshot(profile: dict[str, str | bool]) -> tuple[str, str, str, bool]:
+    return (
+        str(profile["id"]),
+        str(profile["method"]),
+        str(profile["display_label"]),
+        bool(profile["unusable"]),
+    )
+
+
+def _diagnostic_could_affect_openai(entry: Any, openai_profile_ids: set[str]) -> bool:
+    if isinstance(entry, str):
+        value = _safe_text(entry, 256)
+        if value in openai_profile_ids or value.lower().startswith("openai:"):
+            return True
+        if ":" in value or "/" in value:
+            return False
+        return True
+    if not isinstance(entry, dict):
+        return True
+
+    scopes: list[bool] = []
+    for key in ("provider", "authProvider", "auth_provider", "runtimeProvider", "runtime_provider"):
+        value = _safe_text(entry.get(key), 64).lower()
+        if value:
+            scopes.append(value == "openai")
+    for key in ("profileId", "profile_id"):
+        value = _safe_profile_id(entry.get(key))
+        if value:
+            if value in openai_profile_ids or value.lower().startswith("openai:"):
+                scopes.append(True)
+            elif ":" in value:
+                scopes.append(False)
+    for key in ("model", "modelRef", "model_ref"):
+        value = _safe_text(entry.get(key), 256).lower()
+        if value:
+            if value.startswith("openai/"):
+                scopes.append(True)
+            elif "/" in value:
+                scopes.append(False)
+    return any(scopes) if scopes else True
+
+
+def _has_openai_diagnostic(value: Any, openai_profile_ids: set[str]) -> bool:
+    if value in (None, []):
+        return False
+    if not isinstance(value, list):
+        return True
+    return any(_diagnostic_could_affect_openai(row, openai_profile_ids) for row in value)
 
 
 def _credential_assessment(
@@ -330,9 +397,13 @@ def _credential_assessment(
         if not active_profile_id:
             ambiguous = True
 
-    if auth_status.get("modelRouteIssues") not in ([], None):
+    openai_profile_ids = {
+        _safe_profile_id(row.get("id")) for row in openai_rows
+        if _safe_profile_id(row.get("id"))
+    }
+    if _has_openai_diagnostic(auth_status.get("modelRouteIssues"), openai_profile_ids):
         ambiguous = True
-    if auth_status.get("unusableProfiles") not in ([], None):
+    if _has_openai_diagnostic(auth_status.get("unusableProfiles"), openai_profile_ids):
         ambiguous = True
 
     selected = status_dict.get("resolvedDefault") or status_dict.get("defaultModel")
@@ -402,6 +473,7 @@ class OpenAIPlanAuthFacade:
         )
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
+        self._profile_handles: dict[str, tuple[str, tuple[str, str, str, bool]]] = {}
 
     def _argv(self, *parts: str) -> list[str]:
         return list(self._base_cmd_factory()) + ["--profile", self.profile, *parts]
@@ -445,9 +517,49 @@ class OpenAIPlanAuthFacade:
             return plans, None, status_error
         return plans, _credential_assessment(auth_payload, status_payload, plans), ""
 
+    def _publish_profile_handles(self, plans: list[dict[str, str | bool]]) -> dict[str, str]:
+        with self._lock:
+            current = self._profile_handles
+            updated: dict[str, tuple[str, tuple[str, str, str, bool]]] = {}
+            public: dict[str, str] = {}
+            for profile in plans:
+                profile_id = str(profile["id"])
+                snapshot = _profile_snapshot(profile)
+                existing = current.get(profile_id)
+                handle = (
+                    existing[0]
+                    if existing and existing[1] == snapshot
+                    else f"plan_{secrets.token_hex(16)}"
+                )
+                updated[profile_id] = (handle, snapshot)
+                public[profile_id] = handle
+            self._profile_handles = updated
+            return public
+
+    def _resolve_profile_handle(
+        self,
+        handle: str,
+        plans: list[dict[str, str | bool]],
+    ) -> str:
+        with self._lock:
+            matches = [
+                (profile_id, binding)
+                for profile_id, binding in self._profile_handles.items()
+                if binding[0] == handle
+            ]
+            if len(matches) != 1:
+                return ""
+            profile_id, binding = matches[0]
+            fresh = next((row for row in plans if row["id"] == profile_id), None)
+            if fresh is None or _profile_snapshot(fresh) != binding[1]:
+                self._profile_handles.pop(profile_id, None)
+                return ""
+            return profile_id
+
     def status(self) -> dict[str, Any]:
         plans, auth_payload, auth_error = self._current_plan_profiles()
         if auth_error:
+            self._publish_profile_handles([])
             return {
                 "available": False,
                 "connected": False,
@@ -455,7 +567,7 @@ class OpenAIPlanAuthFacade:
                 "reauthRequired": False,
                 "authMethod": "unknown",
                 "billingSource": "unknown",
-                "activeProfileId": "",
+                "activeProfileHandle": "",
                 "displayLabel": "",
                 "selectedModel": "",
                 "runtimeStatus": "unknown",
@@ -470,6 +582,7 @@ class OpenAIPlanAuthFacade:
         active_profile_id = assessment.active_profile_id
         runtime_status = assessment.runtime_status
         selected_model = assessment.selected_model
+        public_handles = self._publish_profile_handles(plans)
         active = next((row for row in plans if row["id"] == active_profile_id), plans[0] if len(plans) == 1 else None)
         connected = bool(plans)
         selected_unusable = bool(active["unusable"]) if active else all(bool(row["unusable"]) for row in plans)
@@ -478,10 +591,10 @@ class OpenAIPlanAuthFacade:
             connected
             and runtime_status == "usable"
             and not reauth
-            and assessment.error_code != "platform_fallback_present"
+            and not assessment.error_code
         )
         method = str(active["method"]) if active else "unknown"
-        label = str(active["label"]) if active else ""
+        label = str(active["display_label"]) if active else ""
         error_code = status_error or assessment.error_code
         recovery = "check_openclaw" if status_error else (
             "review_openai_billing_sources" if assessment.error_code else "reauthenticate" if reauth else ""
@@ -493,7 +606,7 @@ class OpenAIPlanAuthFacade:
             "reauthRequired": reauth,
             "authMethod": method,
             "billingSource": assessment.billing_source,
-            "activeProfileId": active_profile_id,
+            "activeProfileHandle": public_handles.get(active_profile_id, ""),
             "displayLabel": label,
             "selectedModel": selected_model,
             "runtimeStatus": runtime_status,
@@ -502,10 +615,10 @@ class OpenAIPlanAuthFacade:
             "deviceCodeWebSupported": False,
             "profiles": [
                 {
-                    "id": row["id"],
-                    "displayLabel": row["label"],
+                    "handle": public_handles[str(row["id"])],
+                    "displayLabel": row["display_label"],
                     "authMethod": row["method"],
-                    "usable": not bool(row["unusable"]),
+                    "usable": not bool(row["unusable"]) and not bool(assessment.error_code),
                 }
                 for row in plans
             ],
@@ -678,13 +791,16 @@ class OpenAIPlanAuthFacade:
             return {"status": "unavailable", "models": [], "errorCode": error_code}
         return self._catalog()
 
-    def test_and_use(self, profile_id: str, model: str) -> dict[str, Any]:
-        plans, auth_payload, auth_error = self._current_plan_profiles()
-        current_ids = {str(row["id"]) for row in plans}
-        if auth_error or profile_id not in current_ids:
-            raise InvalidRequestError("profile_not_current_plan")
+    def test_and_use(self, profile_handle: str, model: str) -> dict[str, Any]:
+        if not isinstance(profile_handle, str) or not _PUBLIC_HANDLE_RE.fullmatch(profile_handle):
+            raise InvalidRequestError("invalid_profile_handle")
         if not isinstance(model, str) or not _MODEL_REF_RE.fullmatch(model):
             raise InvalidRequestError("invalid_openai_model")
+
+        plans, auth_payload, auth_error = self._current_plan_profiles()
+        profile_id = self._resolve_profile_handle(profile_handle, plans)
+        if auth_error or not profile_id:
+            raise InvalidRequestError("profile_handle_not_current")
         selected_profile = next(row for row in plans if row["id"] == profile_id)
         if bool(selected_profile["unusable"]):
             return self._test_failure("profile_unusable")
@@ -712,8 +828,10 @@ class OpenAIPlanAuthFacade:
         if activated.outcome != "completed" or activated.returncode != 0:
             return self._test_failure("profile_activation_failed")
 
-        _, activated_assessment, activated_error = self._current_credential_assessment()
+        activated_plans, activated_assessment, activated_error = self._current_credential_assessment()
         if activated_error or activated_assessment is None:
+            return self._test_failure("profile_activation_unconfirmed")
+        if self._resolve_profile_handle(profile_handle, activated_plans) != profile_id:
             return self._test_failure("profile_activation_unconfirmed")
         proof_error = self._credential_proof_error(activated_assessment, profile_id)
         if proof_error:
@@ -741,8 +859,10 @@ class OpenAIPlanAuthFacade:
         if self._turn_credential_mismatch(turn_payload, profile_id):
             return self._test_failure("credential_proof_mismatch")
 
-        _, final_assessment, final_error = self._current_credential_assessment()
+        final_plans, final_assessment, final_error = self._current_credential_assessment()
         if final_error or final_assessment is None:
+            return self._test_failure("billing_ambiguity")
+        if self._resolve_profile_handle(profile_handle, final_plans) != profile_id:
             return self._test_failure("billing_ambiguity")
         proof_error = self._credential_proof_error(final_assessment, profile_id)
         if proof_error:

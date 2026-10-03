@@ -1594,7 +1594,7 @@ class OpenAIPlanConnectRequest(BaseModel):
 
 
 class OpenAIPlanTestUseRequest(BaseModel):
-    profileId: str
+    profileHandle: str
     model: str
 
 
@@ -1643,7 +1643,7 @@ async def api_openai_plan_test_use(req: OpenAIPlanTestUseRequest):
     try:
         return await asyncio.to_thread(
             OPENAI_PLAN_AUTH.test_and_use,
-            req.profileId,
+            req.profileHandle,
             req.model,
         )
     except OpenAIPlanInvalidRequest:

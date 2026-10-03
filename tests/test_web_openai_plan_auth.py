@@ -35,8 +35,8 @@ class FakeFacade:
     def models(self):
         return {"status": "empty", "models": [], "errorCode": "catalog_empty"}
 
-    def test_and_use(self, profile_id, model):
-        self.calls.append(("test", profile_id, model))
+    def test_and_use(self, profile_handle, model):
+        self.calls.append(("test", profile_handle, model))
         return {"ok": True, "selectedModel": model, "effectiveProvider": "openai", "testResult": "success", "errorCode": ""}
 
     def shutdown(self):
@@ -55,11 +55,32 @@ def test_openai_plan_routes_are_thin_and_safe(monkeypatch):
         assert client.get("/api/settings/openai-plan/models").json()["status"] == "empty"
         response = client.post(
             "/api/settings/openai-plan/test-use",
-            json={"profileId": "openai:work", "model": "openai/gpt-6-astra"},
+            json={"profileHandle": "plan_0123456789abcdef0123456789abcdef", "model": "openai/gpt-6-astra"},
         )
         assert response.status_code == 200
         assert response.json()["selectedModel"] == "openai/gpt-6-astra"
     assert ("shutdown",) in fake.calls
+
+
+def test_test_use_rejects_unknown_handle_as_400_without_echo(monkeypatch):
+    from easel.openai_plan_auth import InvalidRequestError
+
+    class Reject(FakeFacade):
+        def test_and_use(self, profile_handle, model):
+            raise InvalidRequestError("profile_handle_not_current")
+
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", Reject())
+    local = "http://127.0.0.1:7860"
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/test-use",
+            json={
+                "profileHandle": "openai:user@example.com",
+                "model": "openai/gpt-6-astra",
+            },
+        )
+    assert response.status_code == 400
+    assert "user@example.com" not in json.dumps(response.json())
 
 
 def test_connect_validation_is_400_and_never_echoes_payload(monkeypatch):
