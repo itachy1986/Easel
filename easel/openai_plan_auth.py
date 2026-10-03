@@ -50,6 +50,18 @@ class ProcessResult:
     outcome: str = "completed"  # completed | timeout | cancelled
 
 
+@dataclass(frozen=True)
+class _CredentialAssessment:
+    """Safe, secret-free evidence about OpenAI credential routing."""
+
+    billing_source: str
+    error_code: str
+    exclusive_plan_profile_id: str
+    active_profile_id: str
+    runtime_status: str
+    selected_model: str
+
+
 class BoundedProcessRunner:
     """Run an argv command without a shell and retain only bounded output."""
 
@@ -198,31 +210,168 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
     return normalized
 
 
-def _billing_source(payload: Any, plans: list[dict[str, str | bool]]) -> str:
-    rows = payload.get("profiles") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return "unknown"
-    api_key = any(
-        isinstance(row, dict)
-        and row.get("provider") == "openai"
-        and row.get("type") in {"api_key", "api-key"}
-        for row in rows
+def _credential_assessment(
+    auth_payload: Any,
+    status_payload: Any,
+    plans: list[dict[str, str | bool]],
+) -> _CredentialAssessment:
+    """Classify only bounded metadata exposed by OpenClaw's JSON CLIs.
+
+    A plan profile is exclusive only when the auth listing and runtime status
+    agree that it is the sole usable OpenAI credential. Any possible Platform
+    key or incomplete/contradictory metadata removes that proof.
+    """
+
+    rows = auth_payload.get("profiles") if isinstance(auth_payload, dict) else None
+    openai_rows = [
+        row for row in rows
+        if isinstance(row, dict) and row.get("provider") == "openai"
+    ] if isinstance(rows, list) else []
+    saved_api_keys = sum(row.get("type") in {"api_key", "api-key"} for row in openai_rows)
+    saved_tokens = sum(row.get("type") == "token" for row in openai_rows)
+    known_rows = sum(
+        row.get("type") in {_PLAN_PROFILE_TYPE, "api_key", "api-key", "token"}
+        and bool(_safe_profile_id(row.get("id")))
+        for row in openai_rows
     )
-    unknown = any(
-        isinstance(row, dict)
-        and row.get("provider") == "openai"
-        and row.get("type") not in {_PLAN_PROFILE_TYPE, "api_key", "api-key"}
-        for row in rows
+    ambiguous = (
+        not isinstance(rows, list)
+        or len(openai_rows) != len(rows)
+        or known_rows != len(openai_rows)
+        or saved_tokens > 0
     )
-    if plans and api_key:
-        return "mixed"
-    if plans:
-        return "chatgpt_plan"
-    if api_key:
-        return "platform_api"
-    if unknown:
-        return "unknown"
-    return "none"
+    platform_present = saved_api_keys > 0
+
+    status_dict = status_payload if isinstance(status_payload, dict) else {}
+    auth_status = status_dict.get("auth")
+    if not isinstance(auth_status, dict):
+        auth_status = {}
+        ambiguous = True
+
+    providers = auth_status.get("providers")
+    provider_rows = [
+        row for row in providers
+        if isinstance(row, dict) and row.get("provider") == "openai"
+    ] if isinstance(providers, list) else []
+    if len(provider_rows) != 1:
+        ambiguous = True
+        provider = {}
+    else:
+        provider = provider_rows[0]
+
+    counts = provider.get("profiles") if isinstance(provider, dict) else None
+    expected_counts = {
+        "count": len(openai_rows),
+        "oauth": len(plans),
+        "token": saved_tokens,
+        "apiKey": saved_api_keys,
+    }
+    if not isinstance(counts, dict) or any(
+        not isinstance(counts.get(key), int) or counts.get(key) != value
+        for key, value in expected_counts.items()
+    ):
+        ambiguous = True
+    elif counts.get("apiKey", 0) > 0:
+        platform_present = True
+
+    for source_name in ("env", "modelsJson"):
+        if source_name in provider:
+            source = provider.get(source_name)
+            if source:
+                platform_present = True
+            else:
+                ambiguous = True
+    if provider.get("syntheticAuth"):
+        ambiguous = True
+
+    effective = provider.get("effective") if isinstance(provider, dict) else None
+    effective_kind = effective.get("kind") if isinstance(effective, dict) else ""
+    if effective_kind in {"env", "models.json", "modelsJson"}:
+        platform_present = True
+    elif effective_kind != "profiles":
+        ambiguous = True
+
+    fallback = auth_status.get("shellEnvFallback")
+    applied_keys = fallback.get("appliedKeys") if isinstance(fallback, dict) else None
+    if not isinstance(applied_keys, list):
+        ambiguous = True
+    elif any(isinstance(key, str) and "OPENAI" in key.upper() for key in applied_keys):
+        platform_present = True
+
+    routes = auth_status.get("runtimeAuthRoutes")
+    openai_routes = [
+        row for row in routes
+        if isinstance(row, dict) and row.get("provider") == "openai"
+    ] if isinstance(routes, list) else []
+    active_profile_id = ""
+    runtime_status = "unknown"
+    if len(openai_routes) != 1:
+        ambiguous = True
+    else:
+        route = openai_routes[0]
+        candidate = route.get("status")
+        runtime_status = candidate if candidate in {"usable", "missing", "indeterminate", "unavailable"} else "unknown"
+        if runtime_status == "unknown":
+            ambiguous = True
+        route_effective = route.get("effective")
+        if isinstance(route_effective, dict) and route_effective.get("kind") == "profiles":
+            candidate_profile_id = _safe_profile_id(route_effective.get("detail"))
+            plan_ids = {str(row["id"]) for row in plans}
+            if candidate_profile_id in plan_ids:
+                active_profile_id = candidate_profile_id
+            else:
+                ambiguous = True
+        else:
+            kind = route_effective.get("kind") if isinstance(route_effective, dict) else ""
+            if kind in {"env", "models.json", "modelsJson"}:
+                platform_present = True
+            else:
+                ambiguous = True
+        if not active_profile_id:
+            ambiguous = True
+
+    if auth_status.get("modelRouteIssues") not in ([], None):
+        ambiguous = True
+    if auth_status.get("unusableProfiles") not in ([], None):
+        ambiguous = True
+
+    selected = status_dict.get("resolvedDefault") or status_dict.get("defaultModel")
+    selected_model = selected if isinstance(selected, str) and _MODEL_REF_RE.fullmatch(selected) else ""
+
+    if plans and platform_present:
+        billing_source = "mixed"
+    elif platform_present:
+        billing_source = "platform_api"
+    elif ambiguous:
+        billing_source = "unknown"
+    elif plans:
+        billing_source = "chatgpt_plan"
+    elif openai_rows or ambiguous:
+        billing_source = "unknown"
+    else:
+        billing_source = "none"
+
+    error_code = "platform_fallback_present" if platform_present and plans else "billing_ambiguity" if ambiguous else ""
+    exclusive_plan_profile_id = ""
+    if (
+        not error_code
+        and len(plans) == 1
+        and not bool(plans[0]["unusable"])
+        and active_profile_id == plans[0]["id"]
+        and runtime_status == "usable"
+    ):
+        exclusive_plan_profile_id = str(plans[0]["id"])
+    elif not error_code and len(plans) != 1:
+        error_code = "billing_ambiguity"
+
+    return _CredentialAssessment(
+        billing_source=billing_source,
+        error_code=error_code,
+        exclusive_plan_profile_id=exclusive_plan_profile_id,
+        active_profile_id=active_profile_id,
+        runtime_status=runtime_status,
+        selected_model=selected_model,
+    )
 
 
 class OpenAIPlanAuthFacade:
@@ -285,6 +434,17 @@ class OpenAIPlanAuthFacade:
         payload, error = self._auth_payload()
         return _plan_profiles(payload), payload, error
 
+    def _current_credential_assessment(
+        self,
+    ) -> tuple[list[dict[str, str | bool]], _CredentialAssessment | None, str]:
+        plans, auth_payload, auth_error = self._current_plan_profiles()
+        if auth_error:
+            return plans, None, auth_error
+        status_payload, status_error = self._run_json(["models", "status", "--json"])
+        if status_error:
+            return plans, None, status_error
+        return plans, _credential_assessment(auth_payload, status_payload, plans), ""
+
     def status(self) -> dict[str, Any]:
         plans, auth_payload, auth_error = self._current_plan_profiles()
         if auth_error:
@@ -306,39 +466,33 @@ class OpenAIPlanAuthFacade:
             }
 
         status_payload, status_error = self._run_json(["models", "status", "--json"])
-        status_dict = status_payload if isinstance(status_payload, dict) else {}
-        plan_ids = {str(row["id"]) for row in plans}
-        active_profile_id = ""
-        runtime_status = "unknown"
-        routes = (status_dict.get("auth") or {}).get("runtimeAuthRoutes") if isinstance(status_dict.get("auth"), dict) else []
-        if isinstance(routes, list):
-            route = next((row for row in routes if isinstance(row, dict) and row.get("provider") == "openai"), None)
-            if route:
-                candidate = route.get("status")
-                runtime_status = candidate if candidate in {"usable", "missing", "indeterminate", "unavailable"} else "unknown"
-                effective = route.get("effective")
-                detail = _safe_profile_id(effective.get("detail")) if isinstance(effective, dict) and effective.get("kind") == "profiles" else ""
-                if detail in plan_ids:
-                    active_profile_id = detail
-
-        selected = status_dict.get("resolvedDefault") or status_dict.get("defaultModel")
-        selected_model = selected if isinstance(selected, str) and _MODEL_REF_RE.fullmatch(selected) else ""
+        assessment = _credential_assessment(auth_payload, status_payload, plans)
+        active_profile_id = assessment.active_profile_id
+        runtime_status = assessment.runtime_status
+        selected_model = assessment.selected_model
         active = next((row for row in plans if row["id"] == active_profile_id), plans[0] if len(plans) == 1 else None)
         connected = bool(plans)
         selected_unusable = bool(active["unusable"]) if active else all(bool(row["unusable"]) for row in plans)
         reauth = connected and (selected_unusable or runtime_status in {"missing", "unavailable"})
-        usable = connected and runtime_status == "usable" and not reauth
+        usable = (
+            connected
+            and runtime_status == "usable"
+            and not reauth
+            and assessment.error_code != "platform_fallback_present"
+        )
         method = str(active["method"]) if active else "unknown"
         label = str(active["label"]) if active else ""
-        error_code = status_error
-        recovery = "check_openclaw" if status_error else ("reauthenticate" if reauth else "")
+        error_code = status_error or assessment.error_code
+        recovery = "check_openclaw" if status_error else (
+            "review_openai_billing_sources" if assessment.error_code else "reauthenticate" if reauth else ""
+        )
         return {
             "available": not bool(status_error),
             "connected": connected,
             "usable": usable,
             "reauthRequired": reauth,
             "authMethod": method,
-            "billingSource": _billing_source(auth_payload, plans),
+            "billingSource": assessment.billing_source,
             "activeProfileId": active_profile_id,
             "displayLabel": label,
             "selectedModel": selected_model,
@@ -510,20 +664,38 @@ class OpenAIPlanAuthFacade:
         return {"status": "available", "models": models, "errorCode": ""}
 
     def models(self) -> dict[str, Any]:
-        plans, _, error = self._current_plan_profiles()
+        plans, auth_payload, error = self._current_plan_profiles()
         if error:
             return {"status": "unavailable", "models": [], "errorCode": "auth_status_unavailable"}
         if not plans:
             return {"status": "unavailable", "models": [], "errorCode": "plan_auth_required"}
+        status_payload, status_error = self._run_json(["models", "status", "--json"])
+        if status_error:
+            return {"status": "unavailable", "models": [], "errorCode": "auth_status_unavailable"}
+        assessment = _credential_assessment(auth_payload, status_payload, plans)
+        if assessment.error_code or not assessment.exclusive_plan_profile_id:
+            error_code = assessment.error_code or "billing_ambiguity"
+            return {"status": "unavailable", "models": [], "errorCode": error_code}
         return self._catalog()
 
     def test_and_use(self, profile_id: str, model: str) -> dict[str, Any]:
-        plans, _, auth_error = self._current_plan_profiles()
+        plans, auth_payload, auth_error = self._current_plan_profiles()
         current_ids = {str(row["id"]) for row in plans}
         if auth_error or profile_id not in current_ids:
             raise InvalidRequestError("profile_not_current_plan")
         if not isinstance(model, str) or not _MODEL_REF_RE.fullmatch(model):
             raise InvalidRequestError("invalid_openai_model")
+        selected_profile = next(row for row in plans if row["id"] == profile_id)
+        if bool(selected_profile["unusable"]):
+            return self._test_failure("profile_unusable")
+
+        status_payload, status_error = self._run_json(["models", "status", "--json"])
+        if status_error:
+            return self._test_failure("billing_ambiguity")
+        assessment = _credential_assessment(auth_payload, status_payload, plans)
+        proof_error = self._credential_proof_error(assessment, profile_id)
+        if proof_error:
+            return self._test_failure(proof_error)
 
         # A fresh catalog check is intentionally separate from the profile
         # check above: both facts must still be true at mutation time.
@@ -539,6 +711,15 @@ class OpenAIPlanAuthFacade:
         activated = self._run(["models", "auth", "activate", profile_id])
         if activated.outcome != "completed" or activated.returncode != 0:
             return self._test_failure("profile_activation_failed")
+
+        _, activated_assessment, activated_error = self._current_credential_assessment()
+        if activated_error or activated_assessment is None:
+            return self._test_failure("profile_activation_unconfirmed")
+        proof_error = self._credential_proof_error(activated_assessment, profile_id)
+        if proof_error:
+            return self._test_failure(
+                "profile_activation_unconfirmed" if proof_error == "billing_ambiguity" else proof_error
+            )
 
         # Use an empty one-shot workspace so this proof cannot include Easel's
         # repository, user files, or chat history in model context.
@@ -557,6 +738,15 @@ class OpenAIPlanAuthFacade:
             )
         if turn_error or not self._turn_proves_model(turn_payload, model):
             return self._test_failure("model_test_unproven")
+        if self._turn_credential_mismatch(turn_payload, profile_id):
+            return self._test_failure("credential_proof_mismatch")
+
+        _, final_assessment, final_error = self._current_credential_assessment()
+        if final_error or final_assessment is None:
+            return self._test_failure("billing_ambiguity")
+        proof_error = self._credential_proof_error(final_assessment, profile_id)
+        if proof_error:
+            return self._test_failure(proof_error)
 
         persisted = self._run(["models", "set", model])
         if persisted.outcome != "completed" or persisted.returncode != 0:
@@ -567,7 +757,28 @@ class OpenAIPlanAuthFacade:
             "effectiveProvider": "openai",
             "testResult": "success",
             "errorCode": "",
+            "credentialProof": "exclusive_plan_profile",
         }
+
+    @staticmethod
+    def _credential_proof_error(assessment: _CredentialAssessment, requested_profile_id: str) -> str:
+        if assessment.error_code:
+            return assessment.error_code
+        if assessment.exclusive_plan_profile_id != requested_profile_id:
+            return "billing_ambiguity"
+        return ""
+
+    @staticmethod
+    def _turn_credential_mismatch(payload: Any, requested_profile_id: str) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        actual_profile = payload.get("authProfileId")
+        if actual_profile is not None and _safe_profile_id(actual_profile) != requested_profile_id:
+            return True
+        source = payload.get("credentialSource", payload.get("authSource"))
+        if source is not None and source not in {"oauth", "chatgpt_plan", "codex_plan"}:
+            return True
+        return False
 
     @staticmethod
     def _turn_proves_model(payload: Any, requested: str) -> bool:
