@@ -257,6 +257,68 @@ def run_matrix() -> None:
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_be_visible()
         ))
 
+        # Platform credentials may block activation, but must not block auth.
+        platform_only = plan_status(
+            billingSource="platform_api",
+            errorCode="billing_ambiguity",
+            recoveryAction="review_openai_billing_sources",
+        )
+
+        def platform_only_check(page: Page, api: MockPlanApi) -> None:
+            expect(page.get_by_test_id("plan-risk")).to_contain_text("你仍可登录 ChatGPT Plan")
+            expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_be_enabled()
+            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+
+        with_scenario(browser, MockPlanApi(statuses=[platform_only]), platform_only_check)
+
+        # Billing ambiguity without a plan profile also permits auth while
+        # catalog and activation remain fail closed.
+        disconnected_ambiguous = plan_status(
+            billingSource="unknown",
+            errorCode="billing_ambiguity",
+            recoveryAction="review_openai_billing_sources",
+        )
+
+        def disconnected_ambiguous_check(page: Page, api: MockPlanApi) -> None:
+            expect(page.get_by_test_id("plan-risk")).to_be_visible()
+            expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_be_enabled()
+            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+
+        with_scenario(browser, MockPlanApi(statuses=[disconnected_ambiguous]), disconnected_ambiguous_check)
+
+        # Both OpenClaw-managed login methods remain available in the
+        # Platform-only state; neither path reads or changes a credential.
+        def platform_siwc(page: Page, api: MockPlanApi) -> None:
+            page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
+            expect(page.get_by_role("button", name="取消登录")).to_be_visible()
+            page.wait_for_timeout(1_300)
+            assert any(
+                method == "POST" and path.endswith("/connect")
+                and isinstance(payload, dict) and payload.get("method") == "siwc"
+                for method, path, payload in api.calls
+            )
+            assert any(method == "GET" and "/job/" in path for method, path, _ in api.calls)
+            page.get_by_role("button", name="取消登录").click()
+
+        with_scenario(browser, MockPlanApi(statuses=[platform_only]), platform_siwc)
+
+        def platform_oauth(page: Page, api: MockPlanApi) -> None:
+            page.get_by_text("兼容登录方式", exact=True).click()
+            oauth = page.get_by_role("button", name="使用 OAuth 登录")
+            expect(oauth).to_be_enabled()
+            oauth.click()
+            expect(page.get_by_role("button", name="取消登录")).to_be_visible()
+            assert any(
+                method == "POST" and path.endswith("/connect")
+                and isinstance(payload, dict) and payload.get("method") == "oauth"
+                for method, path, payload in api.calls
+            )
+            page.get_by_role("button", name="取消登录").click()
+
+        with_scenario(browser, MockPlanApi(statuses=[platform_only]), platform_oauth)
+
         # 2. Running -> poll plus an explicit cancel action.
         def running(page: Page, api: MockPlanApi) -> None:
             page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
@@ -288,6 +350,33 @@ def run_matrix() -> None:
             assert "/api/settings/openai-plan/models" in paths
 
         with_scenario(browser, success_api, auth_success)
+
+        # A successful login can still return mixed billing proof.  It must
+        # show the signed-in-but-not-activated state without fetching models.
+        mixed_after_login = usable_status(
+            usable=False,
+            billingSource="mixed",
+            errorCode="platform_fallback_present",
+        )
+        mixed_success_api = MockPlanApi(
+            statuses=[platform_only, mixed_after_login],
+            jobs=[{
+                "jobId": "job123",
+                "state": "success",
+                "method": "siwc",
+                "message": "Connected",
+                "errorCode": "",
+            }],
+        )
+
+        def auth_success_mixed(page: Page, api: MockPlanApi) -> None:
+            page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
+            expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
+            expect(page.get_by_test_id("plan-risk")).to_be_visible()
+            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+
+        with_scenario(browser, mixed_success_api, auth_success_mixed)
 
         # 4. Auth failure is bounded and retryable.
         fail_api = MockPlanApi(jobs=[{
@@ -340,10 +429,34 @@ def run_matrix() -> None:
 
         def mixed_check(page: Page, api: MockPlanApi) -> None:
             expect(page.get_by_test_id("plan-risk")).to_contain_text("意外 API 计费")
+            expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
+            expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_have_count(0)
             expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            page.get_by_text("兼容登录方式", exact=True).click()
+            expect(page.get_by_role("button", name="使用 OAuth 登录")).to_be_disabled()
             assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
 
         with_scenario(browser, MockPlanApi(statuses=[mixed]), mixed_check)
+
+        # A mixed profile may reauthenticate, but still cannot activate or
+        # fetch the executable catalog until exclusive billing is proven.
+        mixed_reauth = usable_status(
+            usable=False,
+            reauthRequired=True,
+            billingSource="mixed",
+            runtimeStatus="missing",
+            errorCode="platform_fallback_present",
+        )
+
+        def mixed_reauth_check(page: Page, api: MockPlanApi) -> None:
+            expect(page.get_by_role("button", name="重新登录 ChatGPT")).to_be_enabled()
+            expect(page.get_by_test_id("plan-risk")).to_be_visible()
+            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            page.get_by_text("兼容登录方式", exact=True).click()
+            expect(page.get_by_role("button", name="使用 OAuth 登录")).to_be_enabled()
+            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+
+        with_scenario(browser, MockPlanApi(statuses=[mixed_reauth]), mixed_reauth_check)
 
         # 8. Ambiguous billing source is also fail closed.
         ambiguous = usable_status(
@@ -514,7 +627,7 @@ def run_matrix() -> None:
             context.close()
 
         browser.close()
-    print("PASS: 14 ChatGPT Plan scenarios + Settings/dark-mode/IME/responsive regressions")
+    print("PASS: ChatGPT Plan auth/activation matrix + Settings/dark-mode/IME/responsive regressions")
 
 
 if __name__ == "__main__":

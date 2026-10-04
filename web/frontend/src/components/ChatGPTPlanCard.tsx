@@ -25,7 +25,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
       return '检测到 ChatGPT Plan 与 OpenAI Platform credential 同时存在。为避免意外 API 计费，Test & use 已禁用。';
     }
     if (status.billingSource === 'platform_api') {
-      return '检测到 OpenAI Platform API credential；这不是 ChatGPT 订阅登录，本卡片不会启用它。';
+      return '检测到 OpenAI Platform credential。你仍可登录 ChatGPT Plan；在 Platform 计费来源未被安全隔离前，Easel 不会启用 Test & use。';
     }
     if (status.errorCode === 'billing_ambiguity'
       || (status.connected && status.billingSource === 'unknown')) {
@@ -52,9 +52,9 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
     return '';
   })();
 
-  const showConnect = Boolean(
+  const canStartAuth = Boolean(
     status?.available
-    && !riskCopy
+    && !busy
     && (status.reauthRequired || !status.connected),
   );
 
@@ -74,7 +74,9 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
             ? <><strong>{status.displayLabel || 'ChatGPT Plan account'}</strong><span>由 OpenClaw 管理</span></>
             : status?.reauthRequired
               ? <span>需要重新登录后才能读取模型并安全验证。</span>
-              : <span>ChatGPT Plan 与 API Key 通道分开管理。</span>}
+              : status?.connected
+                ? <span>ChatGPT Plan 已登录 · 尚未安全启用</span>
+                : <span>ChatGPT Plan 与 API Key 通道分开管理。</span>}
         </div>
 
         {riskCopy ? <div className="plan-notice risk" data-testid="plan-risk" role="alert">{riskCopy}</div> : null}
@@ -87,7 +89,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
           </div>
         ) : null}
 
-        {!busy && showConnect ? (
+        {canStartAuth ? (
           <button className="btn btn-primary" onClick={() => void startConnect('siwc')}>
             {status?.reauthRequired ? '重新登录 ChatGPT' : 'Continue with ChatGPT (Beta)'}
           </button>
@@ -125,7 +127,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
               <strong>OpenClaw-managed OAuth</strong>
               <p>由 OpenClaw 打开浏览器授权；不会读取或复用 Codex CLI 私有 credential store。</p>
             </div>
-            <button className="btn btn-sm" onClick={() => void startConnect('oauth')} disabled={busy || Boolean(riskCopy)}>使用 OAuth 登录</button>
+            <button className="btn btn-sm" onClick={() => void startConnect('oauth')} disabled={!canStartAuth}>使用 OAuth 登录</button>
           </div>
           <div className="plan-compat-row">
             <div>
