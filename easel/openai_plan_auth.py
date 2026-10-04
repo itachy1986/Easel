@@ -457,6 +457,7 @@ class OpenAIPlanAuthFacade:
         cwd: Path | None = None,
         auth_timeout: float = 600,
         command_timeout: float = 30,
+        cold_start_retry_timeout: float = 45,
         test_timeout: float = 120,
         max_jobs: int = 32,
         workspace_factory: Callable[[], Any] | None = None,
@@ -466,6 +467,10 @@ class OpenAIPlanAuthFacade:
         self._runner = runner or BoundedProcessRunner(cwd=cwd)
         self._auth_timeout = auth_timeout
         self._command_timeout = command_timeout
+        self._cold_start_retry_timeout = max(
+            float(command_timeout),
+            float(cold_start_retry_timeout),
+        )
         self._test_timeout = test_timeout
         self._max_jobs = max(4, int(max_jobs))
         self._workspace_factory = workspace_factory or (
@@ -498,6 +503,15 @@ class OpenAIPlanAuthFacade:
         except (json.JSONDecodeError, TypeError):
             return None, "invalid_cli_json"
         return payload, ""
+
+    def _run_json_readonly_with_cold_start_retry(
+        self,
+        parts: list[str],
+    ) -> tuple[Any | None, str]:
+        payload, error = self._run_json(parts)
+        if error != "cli_timeout":
+            return payload, error
+        return self._run_json(parts, timeout=self._cold_start_retry_timeout)
 
     def _auth_payload(self) -> tuple[Any | None, str]:
         return self._run_json(["models", "auth", "list", "--provider", "openai", "--json"])
@@ -557,7 +571,10 @@ class OpenAIPlanAuthFacade:
             return profile_id
 
     def status(self) -> dict[str, Any]:
-        plans, auth_payload, auth_error = self._current_plan_profiles()
+        auth_payload, auth_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "auth", "list", "--provider", "openai", "--json"]
+        )
+        plans = _plan_profiles(auth_payload)
         if auth_error:
             self._publish_profile_handles([])
             return {
@@ -577,7 +594,9 @@ class OpenAIPlanAuthFacade:
                 "profiles": [],
             }
 
-        status_payload, status_error = self._run_json(["models", "status", "--json"])
+        status_payload, status_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "status", "--json"]
+        )
         assessment = _credential_assessment(auth_payload, status_payload, plans)
         active_profile_id = assessment.active_profile_id
         runtime_status = assessment.runtime_status

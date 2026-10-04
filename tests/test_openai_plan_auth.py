@@ -213,6 +213,111 @@ def test_status_normalizes_plan_without_raw_or_secrets():
         assert sentinel not in encoded
 
 
+def test_status_retries_auth_list_timeout_once_with_cold_start_budget():
+    runner = QueueRunner(
+        ProcessResult(-1, "", "", "timeout"),
+        result(PLAN),
+        result(STATUS),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is True
+    assert [call[1] for call in runner.calls] == [30, 45, 30]
+    assert runner.calls[0][0][-6:] == [
+        "models", "auth", "list", "--provider", "openai", "--json",
+    ]
+    assert runner.calls[1][0] == runner.calls[0][0]
+
+
+def test_status_retries_models_status_timeout_once_with_cold_start_budget():
+    runner = QueueRunner(
+        result(PLAN),
+        ProcessResult(-1, "", "", "timeout"),
+        result(STATUS),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is True
+    assert [call[1] for call in runner.calls] == [30, 30, 45]
+    assert runner.calls[1][0][-3:] == ["models", "status", "--json"]
+    assert runner.calls[2][0] == runner.calls[1][0]
+
+
+def test_status_retries_timeout_only_once_and_keeps_public_failure_bounded():
+    runner = QueueRunner(
+        ProcessResult(-1, "ACCESS_SENTINEL", "Authorization: Bearer SECRET", "timeout"),
+        ProcessResult(-1, "REFRESH_SENTINEL", "AUTH_STATE_PATH_SENTINEL", "timeout"),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == "cli_timeout"
+    assert [call[1] for call in runner.calls] == [30, 45]
+    encoded = json.dumps(body)
+    for sentinel in (
+        "ACCESS_SENTINEL", "Authorization", "SECRET",
+        "REFRESH_SENTINEL", "AUTH_STATE_PATH_SENTINEL",
+    ):
+        assert sentinel not in encoded
+
+
+@pytest.mark.parametrize(
+    ("process_result", "error_code"),
+    [
+        (ProcessResult(1, "ACCESS_SENTINEL", "SECRET", "completed"), "cli_failed"),
+        (ProcessResult(0, "not-json ACCESS_SENTINEL", "SECRET", "completed"), "invalid_cli_json"),
+    ],
+)
+def test_status_does_not_retry_non_timeout_readonly_failures(process_result, error_code):
+    runner = QueueRunner(process_result)
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == error_code
+    assert [call[1] for call in runner.calls] == [30]
+    assert "ACCESS_SENTINEL" not in json.dumps(body)
+    assert "SECRET" not in json.dumps(body)
+
+
+def test_status_does_not_retry_cli_unavailable():
+    def unavailable(_argv, _cancel):
+        raise OSError("ACCESS_SENTINEL SECRET")
+
+    runner = QueueRunner(unavailable)
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == "cli_unavailable"
+    assert [call[1] for call in runner.calls] == [30]
+    assert "ACCESS_SENTINEL" not in json.dumps(body)
+    assert "SECRET" not in json.dumps(body)
+
+
 def test_api_key_is_not_plan_and_mixed_is_explicit():
     auth = facade(QueueRunner(result(API_KEY), result(STATUS)))
     only_key = auth.status()
@@ -404,6 +509,7 @@ def test_connect_uses_exact_safe_argv_and_never_exposes_raw_output(method):
     assert "--force" not in command
     assert "--set-default" not in command
     assert "api-key" not in command
+    assert [call[1] for call in runner.calls] == [600, 30]
     assert job["state"] == "success"
     assert "ACCESS_SENTINEL" not in json.dumps(job)
     assert "Authorization" not in json.dumps(job)
@@ -785,6 +891,20 @@ def test_public_handle_is_bound_to_current_profile_snapshot():
     with pytest.raises(InvalidRequestError):
         auth.test_and_use(handle, "openai/gpt-6-astra")
     assert not any("activate" in call[0] for call in runner.calls)
+
+
+def test_test_use_readonly_checks_do_not_use_cold_start_retry_budget():
+    runner = QueueRunner(
+        result(PLAN),
+        result(STATUS),
+        ProcessResult(-1, "ACCESS_SENTINEL", "SECRET", "timeout"),
+    )
+    auth, handle = mapped_facade(runner)
+
+    with pytest.raises(InvalidRequestError, match="profile_handle_not_current"):
+        auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert [call[1] for call in runner.calls] == [30, 30, 30]
 
 
 def test_no_api_key_mutation_or_auth_order_commands_exist_in_facade_source():
