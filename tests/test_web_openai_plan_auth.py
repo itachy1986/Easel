@@ -99,3 +99,31 @@ def test_connect_validation_is_400_and_never_echoes_payload(monkeypatch):
         )
     assert response.status_code == 400
     assert "TOKEN_SENTINEL" not in json.dumps(response.json())
+
+
+def test_frontend_maps_gateway_job_phases_and_safe_failure_codes():
+    hook = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "useChatGPTPlan.ts").read_text(
+        encoding="utf-8"
+    )
+    card = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "ChatGPTPlanCard.tsx").read_text(
+        encoding="utf-8"
+    )
+    api = (PROJECT_ROOT / "web" / "frontend" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+
+    for code in (
+        "gateway_unavailable",
+        "gateway_client_unavailable",
+        "gateway_auth_unavailable",
+        "gateway_rpc_failed",
+        "auth_browser_open_failed",
+        "unsupported_wizard_step",
+        "oauth_choice_unavailable",
+    ):
+        assert code in hook
+
+    for phase in ("gateway_starting", "gateway_connecting", "waiting", "browser_opened"):
+        assert phase in api
+    assert "正在启动本机 OpenClaw Gateway" in card
+    assert "正在建立安全登录连接" in card
+    assert "已打开安全登录页面" in card
+    assert "正在等待 OpenClaw 完成登录" in card

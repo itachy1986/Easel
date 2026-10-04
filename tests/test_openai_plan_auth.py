@@ -15,6 +15,7 @@ from easel.openai_plan_auth import (
     OpenAIPlanAuthFacade,
     ProcessResult,
 )
+from easel.openai_plan_gateway import GatewaySidecarResult
 
 
 PLAN = {
@@ -169,6 +170,31 @@ def wait_done(auth, job_id, timeout=2):
             return job
         time.sleep(0.01)
     raise AssertionError("job did not finish")
+
+
+class FakeGatewaySidecar:
+    def __init__(self, result=GatewaySidecarResult("success", ""), *, block=False):
+        self.result = result
+        self.block = block
+        self.started = threading.Event()
+        self.calls = []
+
+    def run(self, *, method, session_id, timeout, cancel_event, on_phase, on_process):
+        self.calls.append(
+            {
+                "method": method,
+                "sessionId": session_id,
+                "timeout": timeout,
+                "cancelEvent": cancel_event,
+            }
+        )
+        self.started.set()
+        on_phase("gateway_connecting")
+        if self.block:
+            cancel_event.wait(2)
+            return GatewaySidecarResult("cancelled", "auth_cancelled")
+        on_phase("browser_opened")
+        return self.result
 
 
 def test_status_normalizes_plan_without_raw_or_secrets():
@@ -492,41 +518,36 @@ def test_connect_rejects_non_allowlisted_methods(method):
 
 
 @pytest.mark.parametrize("method", ["siwc", "oauth"])
-def test_connect_uses_exact_safe_argv_and_never_exposes_raw_output(method):
-    runner = QueueRunner(
-        ProcessResult(0, "ACCESS_SENTINEL", "Authorization: Bearer SECRET", "completed"),
-        result(PLAN),
+def test_connect_uses_gateway_sidecar_and_fresh_auth_confirmation(method):
+    runner = QueueRunner(result(PLAN))
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        runner,
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
     )
-    auth = facade(runner)
 
     job = wait_done(auth, auth.start_connect(method)["jobId"])
 
-    assert runner.calls[0][0] == [
-        "node.exe", r"C:\npm\openclaw.mjs", "--profile", "easel",
-        "models", "auth", "login", "--provider", "openai", "--method", method,
-    ]
-    command = " ".join(runner.calls[0][0])
-    assert "--force" not in command
-    assert "--set-default" not in command
-    assert "api-key" not in command
-    assert [call[1] for call in runner.calls] == [600, 30]
+    assert len(sidecar.calls) == 1
+    assert sidecar.calls[0]["method"] == method
+    assert sidecar.calls[0]["timeout"] == 600
+    assert len(sidecar.calls[0]["sessionId"]) >= 16
+    assert runner.calls[0][0][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
     assert job["state"] == "success"
-    assert "ACCESS_SENTINEL" not in json.dumps(job)
-    assert "Authorization" not in json.dumps(job)
+    assert job["phase"] == "complete"
+    assert sidecar.calls[0]["sessionId"] not in json.dumps(job)
 
 
 def test_only_one_active_mutation_job_and_cancel_cleanup():
-    started = threading.Event()
-
-    def block(_argv, cancel_event):
-        started.set()
-        assert cancel_event is not None
-        cancel_event.wait(2)
-        return ProcessResult(-1, "TOKEN_SENTINEL", "", "cancelled")
-
-    auth = facade(QueueRunner(block))
+    sidecar = FakeGatewaySidecar(block=True)
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
     first = auth.start_connect("siwc")
-    assert started.wait(1)
+    assert sidecar.started.wait(1)
     with pytest.raises(ActiveJobError):
         auth.start_connect("oauth")
 
@@ -537,19 +558,80 @@ def test_only_one_active_mutation_job_and_cancel_cleanup():
 
 
 @pytest.mark.parametrize(
-    ("process_result", "state", "error_code"),
+    ("sidecar_result", "state", "error_code"),
     [
-        (ProcessResult(1, "", "TOKEN_SENTINEL", "completed"), "fail", "auth_failed"),
-        (ProcessResult(-1, "", "", "timeout"), "fail", "auth_timeout"),
-        (ProcessResult(-1, "", "", "cancelled"), "cancelled", "auth_cancelled"),
+        (GatewaySidecarResult("failure", "gateway_rpc_failed"), "fail", "gateway_rpc_failed"),
+        (GatewaySidecarResult("failure", "auth_timeout"), "fail", "auth_timeout"),
+        (GatewaySidecarResult("cancelled", "auth_cancelled"), "cancelled", "auth_cancelled"),
     ],
 )
-def test_connect_failure_timeout_cancel_are_bounded(process_result, state, error_code):
-    auth = facade(QueueRunner(process_result))
+def test_connect_failure_timeout_cancel_are_bounded(sidecar_result, state, error_code):
+    sidecar = FakeGatewaySidecar(sidecar_result)
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
     job = wait_done(auth, auth.start_connect("oauth")["jobId"])
     assert job["state"] == state
     assert job["errorCode"] == error_code
-    assert "TOKEN_SENTINEL" not in json.dumps(job)
+    assert "SECRET_SENTINEL" not in json.dumps(job)
+
+
+def test_gateway_unavailable_fails_before_sidecar_spawn():
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "gateway_unavailable",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "gateway_unavailable"
+    assert sidecar.calls == []
+
+
+def test_cancel_during_gateway_readiness_never_starts_login_sidecar():
+    entered = threading.Event()
+    release = threading.Event()
+    sidecar = FakeGatewaySidecar()
+
+    def readiness():
+        entered.set()
+        release.wait(2)
+        return ""
+
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=readiness,
+    )
+    started = auth.start_connect("siwc")
+    assert entered.wait(1)
+
+    auth.cancel_job(started["jobId"])
+    release.set()
+    job = wait_done(auth, started["jobId"])
+
+    assert job["state"] == "cancelled"
+    assert job["errorCode"] == "auth_cancelled"
+    assert sidecar.calls == []
+
+
+def test_terminal_success_without_fresh_plan_profile_fails_closed():
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        QueueRunner(result(API_KEY)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_not_confirmed"
 
 
 def test_device_code_is_safe_terminal_only_fallback_without_spawning():

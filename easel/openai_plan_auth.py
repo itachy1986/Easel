@@ -20,7 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from easel.gateway_endpoint import websocket_url
 from easel.openclaw_cmd import openclaw_base_cmd
+from easel.openai_plan_gateway import OpenAIPlanGatewaySidecar, ensure_gateway_ready
 
 
 _ALLOWED_METHODS = frozenset({"siwc", "oauth", "device-code"})
@@ -159,6 +161,7 @@ class _Job:
     job_id: str
     method: str
     state: str = "running"
+    phase: str = "gateway_starting"
     message: str = "Waiting for OpenClaw sign-in"
     error_code: str = ""
     started_at: int = field(default_factory=lambda: int(time.time()))
@@ -461,6 +464,8 @@ class OpenAIPlanAuthFacade:
         test_timeout: float = 120,
         max_jobs: int = 32,
         workspace_factory: Callable[[], Any] | None = None,
+        gateway_sidecar_factory: Callable[[], Any] | None = None,
+        gateway_readiness: Callable[[], str] | None = None,
     ):
         self.profile = profile
         self._base_cmd_factory = base_cmd_factory
@@ -473,8 +478,20 @@ class OpenAIPlanAuthFacade:
         )
         self._test_timeout = test_timeout
         self._max_jobs = max(4, int(max_jobs))
+        self._cwd = Path(cwd).resolve() if cwd else Path(__file__).resolve().parents[1]
         self._workspace_factory = workspace_factory or (
             lambda: tempfile.TemporaryDirectory(prefix="easel-openai-plan-test-")
+        )
+        self._gateway_sidecar_factory = gateway_sidecar_factory or (
+            lambda: OpenAIPlanGatewaySidecar(
+                profile=self.profile,
+                cwd=self._cwd,
+                base_cmd_factory=self._base_cmd_factory,
+                gateway_url_factory=lambda: websocket_url(self.profile),
+            )
+        )
+        self._gateway_readiness = gateway_readiness or (
+            lambda: ensure_gateway_ready(cwd=self._cwd)
         )
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
@@ -659,6 +676,7 @@ class OpenAIPlanAuthFacade:
             "jobId": job.job_id,
             "state": job.state,
             "method": job.method,
+            "phase": job.phase,
             "message": job.message,
             "errorCode": job.error_code,
         }
@@ -677,6 +695,7 @@ class OpenAIPlanAuthFacade:
             self._jobs[job.job_id] = job
             if method == "device-code":
                 job.state = "interaction_required"
+                job.phase = "complete"
                 job.message = "Device-code sign-in is available from the OpenClaw terminal"
                 job.error_code = "device_code_terminal_only"
                 job.ended_at = int(time.time())
@@ -686,50 +705,85 @@ class OpenAIPlanAuthFacade:
             return self._public_job(job)
 
     def _run_auth_job(self, job: _Job) -> None:
-        def remember_process(proc: subprocess.Popen[bytes]) -> None:
+        def remember_process(proc: subprocess.Popen[Any]) -> None:
             with self._lock:
                 job.process = proc
 
+        def update_phase(phase: str) -> None:
+            messages = {
+                "gateway_connecting": "Connecting to the local OpenClaw Gateway",
+                "waiting": "Waiting for OpenClaw sign-in",
+                "browser_opened": "Browser opened for OpenClaw sign-in",
+            }
+            if phase not in messages:
+                return
+            with self._lock:
+                if job.state == "running":
+                    job.phase = phase
+                    job.message = messages[phase]
+
         try:
-            completed = self._runner.run(
-                self._argv("models", "auth", "login", "--provider", "openai", "--method", job.method),
+            readiness_error = self._gateway_readiness()
+            if readiness_error:
+                with self._lock:
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "The local OpenClaw Gateway is unavailable"
+                    job.error_code = "gateway_unavailable"
+                return
+            if job.cancel_event.is_set():
+                with self._lock:
+                    job.state = "cancelled"
+                    job.phase = "complete"
+                    job.message = "Sign-in cancelled"
+                    job.error_code = "auth_cancelled"
+                return
+            sidecar = self._gateway_sidecar_factory()
+            completed = sidecar.run(
+                method=job.method,
+                session_id=secrets.token_urlsafe(24),
                 timeout=self._auth_timeout,
                 cancel_event=job.cancel_event,
+                on_phase=update_phase,
                 on_process=remember_process,
             )
             with self._lock:
-                if completed.outcome == "cancelled" or job.cancel_event.is_set():
+                if completed.outcome == "cancelled" or (
+                    job.cancel_event.is_set() and completed.outcome != "success"
+                ):
                     job.state = "cancelled"
+                    job.phase = "complete"
                     job.message = "Sign-in cancelled"
                     job.error_code = "auth_cancelled"
-                elif completed.outcome == "timeout":
+                elif completed.outcome != "success":
                     job.state = "fail"
-                    job.message = "OpenClaw sign-in timed out"
-                    job.error_code = "auth_timeout"
-                elif completed.returncode != 0:
-                    job.state = "fail"
+                    job.phase = "complete"
                     job.message = "OpenClaw sign-in failed"
-                    job.error_code = "auth_failed"
+                    job.error_code = completed.error_code or "gateway_rpc_failed"
                 else:
                     # Success is confirmed from a fresh safe auth listing, never
-                    # from potentially sensitive interactive command output.
+                    # from the Wizard terminal event alone.
                     plans, _, error = self._current_plan_profiles()
                     if plans and not error:
                         job.state = "success"
+                        job.phase = "complete"
                         job.message = "OpenAI plan sign-in connected"
                         job.error_code = ""
                     else:
                         job.state = "fail"
+                        job.phase = "complete"
                         job.message = "OpenClaw did not confirm an OpenAI plan profile"
                         job.error_code = "auth_not_confirmed"
         except Exception:  # noqa: BLE001 - expose only a bounded generic state
             with self._lock:
                 if job.cancel_event.is_set():
                     job.state = "cancelled"
+                    job.phase = "complete"
                     job.message = "Sign-in cancelled"
                     job.error_code = "auth_cancelled"
                 else:
                     job.state = "fail"
+                    job.phase = "complete"
                     job.message = "OpenClaw sign-in could not be started"
                     job.error_code = "auth_process_error"
         finally:
@@ -751,9 +805,6 @@ class OpenAIPlanAuthFacade:
                 raise JobNotFoundError("auth_job_not_found")
             if job.state == "running":
                 job.cancel_event.set()
-                proc = job.process
-                if proc is not None:
-                    BoundedProcessRunner._stop_process(proc)
             return self._public_job(job)
 
     def _catalog(self) -> dict[str, Any]:
@@ -942,8 +993,10 @@ class OpenAIPlanAuthFacade:
             running = [job for job in self._jobs.values() if job.state == "running"]
             for job in running:
                 job.cancel_event.set()
-                if job.process is not None:
-                    BoundedProcessRunner._stop_process(job.process)
             threads = [job.thread for job in running if job.thread is not None]
         for thread in threads:
             thread.join(timeout=5)
+        with self._lock:
+            remaining = [job.process for job in running if job.process is not None]
+        for proc in remaining:
+            BoundedProcessRunner._stop_process(proc)

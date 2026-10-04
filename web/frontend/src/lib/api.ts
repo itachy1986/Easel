@@ -880,6 +880,7 @@ export function fetchAvailableModels(
 export type OpenAIPlanAuthMethod = 'siwc' | 'oauth' | 'device-code' | 'unknown';
 export type OpenAIPlanBillingSource = 'chatgpt_plan' | 'platform_api' | 'mixed' | 'unknown';
 export type OpenAIPlanJobState = 'running' | 'interaction_required' | 'success' | 'fail' | 'cancelled';
+export type OpenAIPlanJobPhase = 'gateway_starting' | 'gateway_connecting' | 'waiting' | 'browser_opened' | 'complete';
 export type OpenAIPlanCatalogState = 'available' | 'empty' | 'stale' | 'unavailable';
 
 export interface OpenAIPlanProfile {
@@ -909,6 +910,7 @@ export interface OpenAIPlanStatus {
 export interface OpenAIPlanJob {
   jobId: string;
   state: OpenAIPlanJobState;
+  phase: OpenAIPlanJobPhase;
   method: OpenAIPlanAuthMethod;
   message: string;
   errorCode: string;

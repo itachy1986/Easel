@@ -14,7 +14,7 @@ interface Props {
 export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
   const plan = useChatGPTPlan(onSummaryChange);
   const {
-    status, catalog, selectedModel, setSelectedModel, loading, catalogLoading,
+    status, catalog, job, selectedModel, setSelectedModel, loading, catalogLoading,
     testing, message, messageKind, copyNote, openAIModels, busy, canTest,
     startConnect, cancelJob, refreshCatalog, testAndUse, copyDeviceCommand,
   } = plan;
@@ -58,6 +58,13 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
     && (status.reauthRequired || !status.connected),
   );
 
+  const connectingCopy = (() => {
+    if (job?.phase === 'gateway_starting') return '正在启动本机 OpenClaw Gateway…';
+    if (job?.phase === 'gateway_connecting') return 'Gateway 已启动，正在建立安全登录连接…';
+    if (job?.phase === 'browser_opened') return '已打开安全登录页面；请在浏览器完成登录后返回 Easel。';
+    return '正在等待 OpenClaw 完成登录…';
+  })();
+
   return (
     <section className="chatgpt-plan" data-testid="chatgpt-plan-card" aria-labelledby="chatgpt-plan-title">
       <div className="chatgpt-plan-head">
@@ -84,7 +91,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
         {busy ? (
           <div className="plan-connect" data-testid="plan-connecting" role="status">
             <span className="spin" />
-            <span>浏览器将由 OpenClaw 打开；完成登录后返回 Easel。</span>
+            <span>{connectingCopy}</span>
             <button className="btn btn-sm" onClick={() => void cancelJob()}>取消登录</button>
           </div>
         ) : null}

@@ -113,6 +113,7 @@ class MockPlanApi:
     connect: dict[str, Any] = field(default_factory=lambda: {
         "jobId": "job123",
         "state": "running",
+        "phase": "gateway_starting",
         "method": "siwc",
         "message": "",
         "errorCode": "",
@@ -120,6 +121,7 @@ class MockPlanApi:
     jobs: list[dict[str, Any]] = field(default_factory=lambda: [{
         "jobId": "job123",
         "state": "running",
+        "phase": "gateway_starting",
         "method": "siwc",
         "message": "",
         "errorCode": "",
@@ -173,6 +175,7 @@ class MockPlanApi:
             route.fulfill(json={
                 "jobId": path.split("/")[-2],
                 "state": "cancelled",
+                "phase": "complete",
                 "method": "siwc",
                 "message": "",
                 "errorCode": "auth_cancelled",
@@ -322,7 +325,7 @@ def run_matrix() -> None:
         # 2. Running -> poll plus an explicit cancel action.
         def running(page: Page, api: MockPlanApi) -> None:
             page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
-            expect(page.get_by_test_id("plan-connecting")).to_contain_text("浏览器将由 OpenClaw 打开")
+            expect(page.get_by_test_id("plan-connecting")).to_contain_text("正在启动本机 OpenClaw Gateway")
             expect(page.get_by_role("button", name="取消登录")).to_be_visible()
             page.get_by_role("button", name="取消登录").click()
             expect(page.get_by_test_id("plan-message")).to_contain_text("已取消")
@@ -330,12 +333,29 @@ def run_matrix() -> None:
 
         with_scenario(browser, MockPlanApi(), running)
 
+        browser_opened_api = MockPlanApi(jobs=[{
+            "jobId": "job123",
+            "state": "running",
+            "phase": "browser_opened",
+            "method": "siwc",
+            "message": "",
+            "errorCode": "",
+        }])
+
+        def browser_opened(page: Page, _api: MockPlanApi) -> None:
+            page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
+            expect(page.get_by_test_id("plan-connecting")).to_contain_text("已打开安全登录页面")
+            page.get_by_role("button", name="取消登录").click()
+
+        with_scenario(browser, browser_opened_api, browser_opened)
+
         # 3. Successful auth refreshes status and then fetches models.
         success_api = MockPlanApi(
             statuses=[plan_status(), usable_status()],
             jobs=[{
                 "jobId": "job123",
                 "state": "success",
+                "phase": "complete",
                 "method": "siwc",
                 "message": "Connected",
                 "errorCode": "",
@@ -363,6 +383,7 @@ def run_matrix() -> None:
             jobs=[{
                 "jobId": "job123",
                 "state": "success",
+                "phase": "complete",
                 "method": "siwc",
                 "message": "Connected",
                 "errorCode": "",
@@ -382,6 +403,7 @@ def run_matrix() -> None:
         fail_api = MockPlanApi(jobs=[{
             "jobId": "job123",
             "state": "fail",
+            "phase": "complete",
             "method": "siwc",
             "message": SENTINELS[0],
             "errorCode": "auth_failed",
