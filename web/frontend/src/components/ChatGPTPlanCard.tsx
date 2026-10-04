@@ -16,7 +16,8 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
   const {
     status, catalog, job, selectedModel, setSelectedModel, loading, catalogLoading,
     testing, message, messageKind, copyNote, openAIModels, busy, canTest,
-    startConnect, cancelJob, refreshCatalog, testAndUse, copyDeviceCommand,
+    terminalCommand, startConnect, cancelJob, refreshCatalog, testAndUse,
+    copyDeviceCommand, copyInteractiveCommand,
   } = plan;
 
   const riskCopy = (() => {
@@ -62,6 +63,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
     if (job?.phase === 'gateway_starting') return '正在启动本机 OpenClaw Gateway…';
     if (job?.phase === 'gateway_connecting') return 'Gateway 已启动，正在建立安全登录连接…';
     if (job?.phase === 'browser_opened') return '已打开安全登录页面；请在浏览器完成登录后返回 Easel。';
+    if (job?.phase === 'terminal_opened') return '已打开 OpenClaw 登录窗口，请在该窗口/浏览器中完成 ChatGPT 登录。';
     return '正在等待 OpenClaw 完成登录…';
   })();
 
@@ -126,6 +128,14 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
         ) : null}
 
         {message ? <div className={`plan-notice ${messageKind}`} data-testid="plan-message" role="status">{message}</div> : null}
+
+        {terminalCommand ? (
+          <div className="plan-command" data-testid="interactive-login-command">
+            <input value={terminalCommand} readOnly aria-label="OpenClaw interactive login command" />
+            <button className="btn btn-sm" onClick={() => void copyInteractiveCommand()}>复制命令</button>
+            {copyNote ? <span>{copyNote}</span> : null}
+          </div>
+        ) : null}
 
         <details className="plan-compat">
           <summary>兼容登录方式</summary>

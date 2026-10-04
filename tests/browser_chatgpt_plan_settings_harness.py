@@ -22,6 +22,7 @@ from playwright.sync_api import Page, Route, expect, sync_playwright
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:7860"
 DEVICE_COMMAND = "openclaw --profile easel models auth login --provider openai --method device-code"
+INTERACTIVE_COMMAND = "openclaw --profile easel models auth login --provider openai --method siwc"
 SENTINELS = (
     "TOKEN_SENTINEL_NOT_A_SECRET",
     "RAW_PROFILE_SENTINEL",
@@ -348,6 +349,41 @@ def run_matrix() -> None:
             page.get_by_role("button", name="取消登录").click()
 
         with_scenario(browser, browser_opened_api, browser_opened)
+
+        terminal_opened_api = MockPlanApi(jobs=[{
+            "jobId": "job123",
+            "state": "running",
+            "phase": "terminal_opened",
+            "method": "siwc",
+            "message": "",
+            "errorCode": "",
+        }])
+
+        def terminal_opened(page: Page, _api: MockPlanApi) -> None:
+            page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
+            expect(page.get_by_test_id("plan-connecting")).to_contain_text(
+                "已打开 OpenClaw 登录窗口，请在该窗口/浏览器中完成 ChatGPT 登录。"
+            )
+            page.get_by_role("button", name="取消登录").click()
+
+        with_scenario(browser, terminal_opened_api, terminal_opened)
+
+        manual_api = MockPlanApi(jobs=[{
+            "jobId": "job123",
+            "state": "interaction_required",
+            "phase": "complete",
+            "method": "siwc",
+            "message": "",
+            "errorCode": "gateway_unavailable",
+            "terminalCommand": INTERACTIVE_COMMAND,
+        }])
+
+        def manual_terminal(page: Page, _api: MockPlanApi) -> None:
+            page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
+            expect(page.get_by_test_id("interactive-login-command")).to_be_visible()
+            expect(page.get_by_label("OpenClaw interactive login command")).to_have_value(INTERACTIVE_COMMAND)
+
+        with_scenario(browser, manual_api, manual_terminal)
 
         # 3. Successful auth refreshes status and then fetches models.
         success_api = MockPlanApi(

@@ -13,6 +13,8 @@ const JOB_STORAGE_KEY = 'easel_openai_plan_auth_job';
 const JOB_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 export const DEVICE_CODE_COMMAND = 'openclaw --profile easel models auth login --provider openai --method device-code';
+export const INTERACTIVE_LOGIN_COMMAND = 'openclaw --profile easel models auth login --provider openai --method siwc';
+export const OAUTH_LOGIN_COMMAND = 'openclaw --profile easel models auth login --provider openai --method oauth';
 
 export interface ChatGPTPlanSummary {
   usable: boolean;
@@ -115,6 +117,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
   const [message, setMessage] = useState('');
   const [messageKind, setMessageKind] = useState<PlanMessageKind>('warn');
   const [copyNote, setCopyNote] = useState('');
+  const [terminalCommand, setTerminalCommand] = useState('');
 
   const refreshStatus = useCallback(async () => {
     setLoading(true);
@@ -196,7 +199,12 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
       setMessage('登录已取消。');
     } else if (next.state === 'interaction_required') {
       setMessageKind('warn');
-      setMessage('请在 OpenClaw 终端完成所需操作。');
+      const deviceCode = next.method === 'device-code';
+      const oauth = next.method === 'oauth';
+      setMessage(deviceCode
+        ? '请在本机终端运行 OpenClaw device-code 登录命令。'
+        : 'Gateway 暂不可用，请在本机终端运行 OpenClaw 登录命令。');
+      setTerminalCommand(deviceCode ? DEVICE_CODE_COMMAND : oauth ? OAUTH_LOGIN_COMMAND : INTERACTIVE_LOGIN_COMMAND);
     } else {
       setMessageKind('error');
       setMessage(safeError(next.errorCode, '登录失败，请重试。'));
@@ -236,6 +244,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
   const startConnect = useCallback(async (method: 'siwc' | 'oauth') => {
     setStarting(true);
     setMessage('');
+    setTerminalCommand('');
     try {
       const next = await connectOpenAIPlan(method);
       if (!mountedRef.current) return;
@@ -329,6 +338,15 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     }
   }, []);
 
+  const copyInteractiveCommand = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(terminalCommand || INTERACTIVE_LOGIN_COMMAND);
+      setCopyNote('已复制');
+    } catch {
+      setCopyNote('请手动复制');
+    }
+  }, [terminalCommand]);
+
   return {
     status,
     catalog,
@@ -341,6 +359,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     message,
     messageKind,
     copyNote,
+    terminalCommand,
     openAIModels,
     busy,
     canTest,
@@ -349,5 +368,6 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     refreshCatalog,
     testAndUse,
     copyDeviceCommand,
+    copyInteractiveCommand,
   };
 }

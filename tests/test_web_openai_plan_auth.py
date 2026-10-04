@@ -121,9 +121,12 @@ def test_frontend_maps_gateway_job_phases_and_safe_failure_codes():
     ):
         assert code in hook
 
-    for phase in ("gateway_starting", "gateway_connecting", "waiting", "browser_opened"):
+    for phase in ("gateway_starting", "gateway_connecting", "waiting", "browser_opened", "terminal_opened"):
         assert phase in api
     assert "正在启动本机 OpenClaw Gateway" in card
     assert "正在建立安全登录连接" in card
     assert "已打开安全登录页面" in card
+    assert "已打开 OpenClaw 登录窗口，请在该窗口/浏览器中完成 ChatGPT 登录。" in card
     assert "正在等待 OpenClaw 完成登录" in card
+    assert "openclaw --profile easel models auth login --provider openai --method siwc" in hook
+    assert "terminalCommand" in hook

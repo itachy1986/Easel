@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import threading
 import time
 from contextlib import nullcontext
@@ -11,6 +12,7 @@ import pytest
 from easel.openai_plan_auth import (
     ActiveJobError,
     BoundedProcessRunner,
+    InteractiveAuthProcessRunner,
     InvalidRequestError,
     OpenAIPlanAuthFacade,
     ProcessResult,
@@ -194,6 +196,30 @@ class FakeGatewaySidecar:
             cancel_event.wait(2)
             return GatewaySidecarResult("cancelled", "auth_cancelled")
         on_phase("browser_opened")
+        return self.result
+
+
+class FakeInteractiveRunner:
+    def __init__(self, result=ProcessResult(0, "", "", "completed"), *, block=False):
+        self.result = result
+        self.block = block
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = []
+
+    def run(self, argv, *, timeout, cancel_event, on_process):
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "timeout": timeout,
+                "cancelEvent": cancel_event,
+            }
+        )
+        self.started.set()
+        if self.block:
+            while not self.release.wait(0.01):
+                if cancel_event.is_set():
+                    return ProcessResult(-1, "", "", "cancelled")
         return self.result
 
 
@@ -578,19 +604,276 @@ def test_connect_failure_timeout_cancel_are_bounded(sidecar_result, state, error
     assert "SECRET_SENTINEL" not in json.dumps(job)
 
 
-def test_gateway_unavailable_fails_before_sidecar_spawn():
+def test_gateway_unavailable_on_non_windows_requires_manual_terminal_without_sidecar():
     sidecar = FakeGatewaySidecar()
     auth = facade(
         QueueRunner(),
         gateway_sidecar_factory=lambda: sidecar,
         gateway_readiness=lambda: "gateway_unavailable",
+        platform_name="posix",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "interaction_required"
+    assert job["errorCode"] == "gateway_unavailable"
+    assert sidecar.calls == []
+
+
+def test_gateway_ready_never_launches_interactive_fallback():
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert len(sidecar.calls) == 1
+    assert interactive.calls == []
+
+
+@pytest.mark.parametrize("method", ["siwc", "oauth"])
+def test_gateway_unavailable_on_windows_launches_exact_interactive_argv_and_confirms_fresh_profile(method):
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    runner = QueueRunner(result(PLAN))
+    auth = facade(
+        runner,
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect(method)["jobId"])
+
+    assert job["state"] == "success"
+    assert sidecar.calls == []
+    assert interactive.calls[0]["argv"] == [
+        "node.exe",
+        r"C:\npm\openclaw.mjs",
+        "--profile",
+        "easel",
+        "models",
+        "auth",
+        "login",
+        "--provider",
+        "openai",
+        "--method",
+        method,
+    ]
+    assert interactive.calls[0]["timeout"] == 600
+    assert runner.calls[0][0][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
+    assert "token" not in " ".join(interactive.calls[0]["argv"]).lower()
+    assert "url" not in " ".join(interactive.calls[0]["argv"]).lower()
+
+
+def test_interactive_runner_uses_visible_console_without_shell_or_stdio_capture(monkeypatch):
+    seen = {}
+
+    class Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return Proc()
+
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+
+    got = InteractiveAuthProcessRunner(cwd=None).run(
+        ["node.exe", "openclaw.mjs", "--profile", "easel"],
+        timeout=1,
+        cancel_event=threading.Event(),
+        on_process=None,
+    )
+
+    assert got == ProcessResult(0, "", "", "completed")
+    assert seen["kwargs"]["shell"] is False
+    assert seen["kwargs"]["creationflags"] == 0x210
+    assert "stdout" not in seen["kwargs"]
+    assert "stderr" not in seen["kwargs"]
+    assert "stdin" not in seen["kwargs"]
+
+
+@pytest.mark.parametrize(("cancelled", "expected"), [(True, "cancelled"), (False, "timeout")])
+def test_interactive_runner_stops_only_its_tracked_child(monkeypatch, cancelled, expected):
+    cancel_event = threading.Event()
+
+    class Proc:
+        returncode = None
+        terminate_calls = 0
+        kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("openclaw", timeout)
+            return self.returncode
+
+        def terminate(self):
+            self.terminate_calls += 1
+            self.returncode = 1
+
+        def kill(self):
+            self.kill_calls += 1
+            self.returncode = 1
+
+    tracked = Proc()
+    unrelated = Proc()
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.Popen", lambda *_args, **_kwargs: tracked)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+
+    def remember(_proc):
+        if cancelled:
+            cancel_event.set()
+
+    got = InteractiveAuthProcessRunner(cwd=None).run(
+        ["node.exe", "openclaw.mjs"],
+        timeout=0.01,
+        cancel_event=cancel_event,
+        on_process=remember,
+    )
+
+    assert got.outcome == expected
+    assert tracked.terminate_calls == 1
+    assert tracked.kill_calls == 0
+    assert unrelated.terminate_calls == 0
+    assert unrelated.kill_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("completed", "state", "error_code"),
+    [
+        (ProcessResult(7, "TERMINAL_SECRET", "TERMINAL_SECRET", "completed"), "fail", "auth_failed"),
+        (ProcessResult(-1, "TERMINAL_SECRET", "TERMINAL_SECRET", "timeout"), "fail", "auth_timeout"),
+        (ProcessResult(-1, "TERMINAL_SECRET", "TERMINAL_SECRET", "cancelled"), "cancelled", "auth_cancelled"),
+    ],
+)
+def test_interactive_failure_states_do_not_expose_terminal_output(completed, state, error_code):
+    interactive = FakeInteractiveRunner(completed)
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == state
+    assert job["errorCode"] == error_code
+    assert "TERMINAL_SECRET" not in json.dumps(job)
+
+
+def test_interactive_exit_zero_without_fresh_plan_profile_fails_closed():
+    auth = facade(
+        QueueRunner(result(API_KEY)),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=FakeInteractiveRunner(),
+        platform_name="nt",
     )
 
     job = wait_done(auth, auth.start_connect("siwc")["jobId"])
 
     assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_not_confirmed"
+
+
+def test_existing_profile_cannot_complete_windows_fallback_before_child_exit():
+    interactive = FakeInteractiveRunner(block=True)
+    runner = QueueRunner(result(PLAN))
+    auth = facade(
+        runner,
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    started = auth.start_connect("siwc")
+    assert interactive.started.wait(1)
+    running = auth.get_job(started["jobId"])
+    assert running["state"] == "running"
+    assert running["phase"] == "terminal_opened"
+    assert running["message"] == "OpenClaw interactive sign-in window opened"
+    assert runner.calls == []
+    interactive.release.set()
+
+    assert wait_done(auth, started["jobId"])["state"] == "success"
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("method", ["siwc", "oauth"])
+def test_non_windows_gateway_unavailable_never_auto_launches_terminal(method):
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="posix",
+    )
+
+    job = wait_done(auth, auth.start_connect(method)["jobId"])
+
+    assert job["state"] == "interaction_required"
     assert job["errorCode"] == "gateway_unavailable"
-    assert sidecar.calls == []
+    assert job["terminalCommand"] == f"openclaw --profile easel models auth login --provider openai --method {method}"
+    assert interactive.calls == []
+
+
+def test_cancelled_windows_fallback_stops_only_the_tracked_child():
+    interactive = FakeInteractiveRunner(block=True)
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    started = auth.start_connect("siwc")
+    assert interactive.started.wait(1)
+    auth.cancel_job(started["jobId"])
+    job = wait_done(auth, started["jobId"])
+
+    assert job["state"] == "cancelled"
+    assert job["errorCode"] == "auth_cancelled"
+    assert len(interactive.calls) == 1
+
+
+def test_interactive_child_launch_failure_is_bounded():
+    class BrokenRunner:
+        def run(self, *_args, **_kwargs):
+            raise OSError("TERMINAL_SECRET")
+
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=BrokenRunner(),
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_process_error"
+    assert "TERMINAL_SECRET" not in json.dumps(job)
 
 
 def test_cancel_during_gateway_readiness_never_starts_login_sidecar():
