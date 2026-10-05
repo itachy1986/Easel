@@ -30,7 +30,7 @@ EXPECTED_OPENCLAW_VERSION = "2026.9.7"
 _PUBLIC_EXPORT = "./plugin-sdk/gateway-runtime"
 _AUTH_HOST_SUFFIXES = ("openai.com", "chatgpt.com")
 _SIDECAR_EVENTS = frozenset({
-    "ready", "waiting", "open_url", "success", "cancelled", "failure", "gateway_error",
+    "ready", "admitted", "waiting", "open_url", "success", "cancelled", "failure", "gateway_error",
 })
 _PUBLIC_ERROR_CODES = frozenset({
     "auth_browser_open_failed",
@@ -64,6 +64,7 @@ class GatewayRuntime:
 class GatewaySidecarResult:
     outcome: str
     error_code: str = ""
+    fallback_eligible: bool = False
 
     def public_dict(self) -> dict[str, str]:
         return {"outcome": self.outcome, "errorCode": self.error_code}
@@ -227,7 +228,9 @@ class OpenAIPlanGatewaySidecar:
             if not _is_loopback_websocket_url(gateway_url) or not self.sidecar_path.is_file():
                 raise GatewayClientUnavailable("gateway_client_unavailable")
         except (GatewayClientUnavailable, OSError, TypeError, ValueError):
-            return GatewaySidecarResult("failure", "gateway_client_unavailable")
+            return GatewaySidecarResult(
+                "failure", "gateway_client_unavailable", fallback_eligible=True
+            )
 
         env = self._environment.copy()
         env["OPENCLAW_PROFILE"] = self.profile
@@ -237,21 +240,27 @@ class OpenAIPlanGatewaySidecar:
         deadline = time.monotonic() + max(0.25, float(timeout))
         cancel_sent = False
         timed_out = False
+        admission_seen = False
 
         try:
-            proc = self._popen_factory(
-                argv,
-                cwd=str(self.cwd),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                shell=False,
-                env=env,
-            )
+            try:
+                proc = self._popen_factory(
+                    argv,
+                    cwd=str(self.cwd),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    shell=False,
+                    env=env,
+                )
+            except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+                return GatewaySidecarResult(
+                    "failure", "gateway_rpc_failed", fallback_eligible=True
+                )
             if on_process:
                 on_process(proc)
             if on_phase:
@@ -289,7 +298,9 @@ class OpenAIPlanGatewaySidecar:
                 },
             )
             if not started:
-                return GatewaySidecarResult("failure", "gateway_rpc_failed")
+                return GatewaySidecarResult(
+                    "failure", "gateway_rpc_failed", fallback_eligible=True
+                )
 
             while True:
                 now = time.monotonic()
@@ -325,6 +336,11 @@ class OpenAIPlanGatewaySidecar:
                     return GatewaySidecarResult("failure", "gateway_rpc_failed")
                 if event == "ready":
                     continue
+                if event == "admitted":
+                    if admission_seen:
+                        return GatewaySidecarResult("failure", "gateway_rpc_failed")
+                    admission_seen = True
+                    continue
                 if event == "waiting":
                     if on_phase:
                         on_phase("waiting")
@@ -354,7 +370,13 @@ class OpenAIPlanGatewaySidecar:
                     )
                 code = payload.get("code")
                 safe_code = code if isinstance(code, str) and code in _PUBLIC_ERROR_CODES else "gateway_rpc_failed"
-                return GatewaySidecarResult("failure", safe_code)
+                fallback_eligible = (
+                    not admission_seen
+                    and payload.get("fallbackEligible") is True
+                )
+                return GatewaySidecarResult(
+                    "failure", safe_code, fallback_eligible=fallback_eligible
+                )
         except (OSError, subprocess.SubprocessError, ValueError, TypeError):
             return GatewaySidecarResult("failure", "gateway_rpc_failed")
         finally:
@@ -373,7 +395,7 @@ class OpenAIPlanGatewaySidecar:
                         pass
 
 
-def _default_ready_probe() -> bool:
+def probe_gateway_ready() -> bool:
     try:
         with urllib.request.urlopen(healthz_url(), timeout=2) as response:  # noqa: S310 - fixed loopback URL
             return response.status == 200
@@ -384,7 +406,7 @@ def _default_ready_probe() -> bool:
 def ensure_gateway_ready(
     *,
     cwd: Path,
-    ready_probe: Callable[[], bool] = _default_ready_probe,
+    ready_probe: Callable[[], bool] = probe_gateway_ready,
     command_runner: Callable[..., Any] = subprocess.run,
     platform: str = sys.platform,
     timeout: float = 75,

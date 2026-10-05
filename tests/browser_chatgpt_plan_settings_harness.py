@@ -481,13 +481,17 @@ def run_matrix() -> None:
         # 7. Mixed/platform fallback is explicit and fail closed.
         mixed = usable_status(
             usable=False,
+            reauthRequired=False,
             billingSource="mixed",
+            runtimeStatus="unavailable",
             errorCode="platform_fallback_present",
         )
 
         def mixed_check(page: Page, api: MockPlanApi) -> None:
             expect(page.get_by_test_id("plan-risk")).to_contain_text("意外 API 计费")
             expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
+            expect(page.locator(".chatgpt-plan-head .pill")).to_contain_text("需检查")
+            expect(page.get_by_role("button", name="重新登录 ChatGPT")).to_have_count(0)
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_have_count(0)
             expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
             page.get_by_text("兼容登录方式", exact=True).click()
@@ -496,8 +500,8 @@ def run_matrix() -> None:
 
         with_scenario(browser, MockPlanApi(statuses=[mixed]), mixed_check)
 
-        # A mixed profile may reauthenticate, but still cannot activate or
-        # fetch the executable catalog until exclusive billing is proven.
+        # A mixed profile with explicit credential reauth evidence may still
+        # reauthenticate, but cannot activate until exclusive billing is proven.
         mixed_reauth = usable_status(
             usable=False,
             reauthRequired=True,

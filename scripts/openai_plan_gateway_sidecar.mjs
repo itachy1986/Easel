@@ -114,7 +114,7 @@ async function stopClient() {
   }
 }
 
-async function finish(event, code = "") {
+async function finish(event, code = "", fallbackEligible = false) {
   if (terminal) return;
   terminal = true;
   lifetime.abort();
@@ -123,7 +123,9 @@ async function finish(event, code = "") {
     browserAck = null;
   }
   await stopClient();
-  emit(code ? { event, code } : { event });
+  const payload = code ? { event, code } : { event };
+  if (event === "failure" && fallbackEligible === true) payload.fallbackEligible = true;
+  emit(payload);
   rl.close();
   setImmediate(() => process.exit(0));
 }
@@ -165,7 +167,6 @@ async function applyWizardResult(result) {
 
 async function runWizard(startResult) {
   if (await applyWizardResult(startResult)) return;
-  admitted = true;
   emit({ event: "waiting" });
   let answer;
   while (!terminal) {
@@ -246,6 +247,7 @@ async function startFlow(start) {
   // From this point the Gateway may create the session before replying, so
   // every failure/cancel path must attempt exact-session cleanup.
   admitted = true;
+  emit({ event: "admitted" });
   const result = await request(
     "models.authLogin",
     { sessionId, agentId: "main", authChoice },
@@ -264,7 +266,11 @@ async function handleCommand(command) {
       await startFlow(command);
     } catch (error) {
       await cancelWizard();
-      await finish("failure", error instanceof SafeFailure ? error.code : "gateway_rpc_failed");
+      await finish(
+        "failure",
+        error instanceof SafeFailure ? error.code : "gateway_rpc_failed",
+        !admitted,
+      );
     }
     return;
   }

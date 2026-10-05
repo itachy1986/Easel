@@ -384,6 +384,36 @@ def test_api_key_is_not_plan_and_mixed_is_explicit():
     assert body["activeProfileHandle"].startswith("plan_")
 
 
+def test_runtime_unavailable_with_mixed_credentials_does_not_require_reauth():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    runtime_unavailable = status_with_saved_api_key()
+    runtime_unavailable["auth"]["runtimeAuthRoutes"][0]["status"] = "unavailable"
+
+    body = facade(QueueRunner(result(mixed), result(runtime_unavailable))).status()
+
+    assert body["available"] is True
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["runtimeStatus"] == "unavailable"
+    assert body["billingSource"] == "mixed"
+    assert body["errorCode"] == "platform_fallback_present"
+    assert body["recoveryAction"] == "review_openai_billing_sources"
+
+
+def test_runtime_missing_alone_does_not_require_reauth():
+    runtime_missing = json.loads(json.dumps(STATUS))
+    runtime_missing["auth"]["runtimeAuthRoutes"][0]["status"] = "missing"
+
+    body = facade(QueueRunner(result(PLAN), result(runtime_missing))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["runtimeStatus"] == "missing"
+    assert body["recoveryAction"] != "reauthenticate"
+
+
 @pytest.mark.parametrize(
     "platform_status",
     [
@@ -635,6 +665,114 @@ def test_gateway_ready_never_launches_interactive_fallback():
 
     assert job["state"] == "success"
     assert len(sidecar.calls) == 1
+    assert interactive.calls == []
+
+
+def test_windows_offline_default_route_uses_readonly_probe_without_gateway_start(monkeypatch):
+    gateway_starts = []
+    monkeypatch.setattr(
+        "easel.openai_plan_auth.ensure_gateway_ready",
+        lambda **kwargs: gateway_starts.append(kwargs) or "",
+    )
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_ready_probe=lambda: False,
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert gateway_starts == []
+    assert sidecar.calls == []
+    assert len(interactive.calls) == 1
+    assert interactive.calls[0]["argv"][-7:] == [
+        "models", "auth", "login", "--provider", "openai", "--method", "siwc",
+    ]
+
+
+def test_windows_ready_default_route_uses_sidecar_without_interactive_fallback(monkeypatch):
+    gateway_starts = []
+    monkeypatch.setattr(
+        "easel.openai_plan_auth.ensure_gateway_ready",
+        lambda **kwargs: gateway_starts.append(kwargs) or "",
+    )
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_ready_probe=lambda: True,
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert gateway_starts == []
+    assert len(sidecar.calls) == 1
+    assert interactive.calls == []
+
+
+def test_windows_pre_auth_sidecar_failure_falls_back_after_sidecar_settles():
+    sequence = []
+
+    class SettledSidecar(FakeGatewaySidecar):
+        def run(self, **kwargs):
+            sequence.append("sidecar_started")
+            completed = super().run(**kwargs)
+            sequence.append("sidecar_settled")
+            return completed
+
+    class SequencedInteractive(FakeInteractiveRunner):
+        def run(self, argv, **kwargs):
+            sequence.append("interactive_started")
+            return super().run(argv, **kwargs)
+
+    sidecar = SettledSidecar(
+        GatewaySidecarResult("failure", "gateway_client_unavailable", fallback_eligible=True)
+    )
+    interactive = SequencedInteractive()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert sequence == ["sidecar_started", "sidecar_settled", "interactive_started"]
+
+
+@pytest.mark.parametrize(
+    "sidecar_result",
+    [
+        GatewaySidecarResult("failure", "gateway_rpc_failed", fallback_eligible=False),
+        GatewaySidecarResult("failure", "auth_timeout", fallback_eligible=True),
+        GatewaySidecarResult("cancelled", "auth_cancelled", fallback_eligible=True),
+    ],
+)
+def test_windows_sidecar_post_admission_timeout_or_cancel_never_falls_back(sidecar_result):
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: FakeGatewaySidecar(sidecar_result),
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] in {"fail", "cancelled"}
     assert interactive.calls == []
 
 

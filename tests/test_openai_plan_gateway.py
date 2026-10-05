@@ -153,10 +153,15 @@ def test_gateway_readiness_failure_is_safe_and_bounded(tmp_path):
 
 
 def test_sidecar_result_is_a_code_only_boundary():
-    result = GatewaySidecarResult(outcome="failure", error_code="gateway_rpc_failed")
+    result = GatewaySidecarResult(
+        outcome="failure",
+        error_code="gateway_rpc_failed",
+        fallback_eligible=True,
+    )
     encoded = json.dumps(result.public_dict())
 
     assert encoded == '{"outcome": "failure", "errorCode": "gateway_rpc_failed"}'
+    assert "fallback" not in encoded.lower()
     assert "SECRET_SENTINEL" not in encoded
 
 
@@ -422,7 +427,9 @@ def test_sidecar_rejects_non_loopback_gateway_without_starting_node(tmp_path):
         cancel_event=threading.Event(),
     )
 
-    assert result == GatewaySidecarResult("failure", "gateway_client_unavailable")
+    assert result == GatewaySidecarResult(
+        "failure", "gateway_client_unavailable", fallback_eligible=True
+    )
     assert not trace.exists()
     assert observed == {}
 
@@ -488,7 +495,9 @@ def test_gateway_auth_failure_and_child_stderr_are_reduced_to_code_only(tmp_path
     )
 
     captured = capsys.readouterr()
-    assert result == GatewaySidecarResult("failure", "gateway_auth_unavailable")
+    assert result == GatewaySidecarResult(
+        "failure", "gateway_auth_unavailable", fallback_eligible=True
+    )
     assert "DEVICE_TOKEN_SENTINEL" not in captured.out
     assert "DEVICE_TOKEN_SENTINEL" not in captured.err
     assert "DEVICE_TOKEN_SENTINEL" not in json.dumps(result.public_dict())
@@ -506,7 +515,9 @@ def test_oauth_without_one_current_official_choice_fails_closed(tmp_path):
     )
 
     rows = _read_trace(trace)
-    assert result == GatewaySidecarResult("failure", "oauth_choice_unavailable")
+    assert result == GatewaySidecarResult(
+        "failure", "oauth_choice_unavailable", fallback_eligible=True
+    )
     assert not any(row.get("method") == "models.authLogin" for row in rows)
     assert rows[-1]["type"] == "stop"
 

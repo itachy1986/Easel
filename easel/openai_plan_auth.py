@@ -23,7 +23,11 @@ from typing import Any, Callable
 
 from easel.gateway_endpoint import websocket_url
 from easel.openclaw_cmd import openclaw_base_cmd
-from easel.openai_plan_gateway import OpenAIPlanGatewaySidecar, ensure_gateway_ready
+from easel.openai_plan_gateway import (
+    OpenAIPlanGatewaySidecar,
+    ensure_gateway_ready,
+    probe_gateway_ready,
+)
 
 
 _ALLOWED_METHODS = frozenset({"siwc", "oauth", "device-code"})
@@ -526,6 +530,7 @@ class OpenAIPlanAuthFacade:
         workspace_factory: Callable[[], Any] | None = None,
         gateway_sidecar_factory: Callable[[], Any] | None = None,
         gateway_readiness: Callable[[], str] | None = None,
+        gateway_ready_probe: Callable[[], bool] | None = None,
         interactive_runner: Any | None = None,
         platform_name: str | None = None,
     ):
@@ -552,11 +557,15 @@ class OpenAIPlanAuthFacade:
                 gateway_url_factory=lambda: websocket_url(self.profile),
             )
         )
-        self._gateway_readiness = gateway_readiness or (
-            lambda: ensure_gateway_ready(cwd=self._cwd)
-        )
-        self._interactive_runner = interactive_runner or InteractiveAuthProcessRunner(cwd=self._cwd)
         self._platform_name = platform_name or os.name
+        if gateway_readiness is not None:
+            self._gateway_readiness = gateway_readiness
+        elif self._platform_name == "nt":
+            ready_probe = gateway_ready_probe or probe_gateway_ready
+            self._gateway_readiness = lambda: "" if ready_probe() else "gateway_unavailable"
+        else:
+            self._gateway_readiness = lambda: ensure_gateway_ready(cwd=self._cwd)
+        self._interactive_runner = interactive_runner or InteractiveAuthProcessRunner(cwd=self._cwd)
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
         self._profile_handles: dict[str, tuple[str, tuple[str, str, str, bool]]] = {}
@@ -686,7 +695,10 @@ class OpenAIPlanAuthFacade:
         active = next((row for row in plans if row["id"] == active_profile_id), plans[0] if len(plans) == 1 else None)
         connected = bool(plans)
         selected_unusable = bool(active["unusable"]) if active else all(bool(row["unusable"]) for row in plans)
-        reauth = connected and (selected_unusable or runtime_status in {"missing", "unavailable"})
+        # Credential validity and runtime availability are independent facts.
+        # Missing/unavailable routing must not turn a persisted plan profile
+        # into a reauthentication request; only credential evidence may do so.
+        reauth = connected and selected_unusable
         usable = (
             connected
             and runtime_status == "usable"
@@ -789,6 +801,56 @@ class OpenAIPlanAuthFacade:
                     job.phase = phase
                     job.message = messages[phase]
 
+        def run_interactive_fallback() -> None:
+            update_phase("terminal_opened")
+            completed = self._interactive_runner.run(
+                self._argv(
+                    "models",
+                    "auth",
+                    "login",
+                    "--provider",
+                    "openai",
+                    "--method",
+                    job.method,
+                ),
+                timeout=self._auth_timeout,
+                cancel_event=job.cancel_event,
+                on_process=remember_process,
+            )
+            if completed.outcome == "cancelled" or job.cancel_event.is_set():
+                with self._lock:
+                    job.state = "cancelled"
+                    job.phase = "complete"
+                    job.message = "Sign-in cancelled"
+                    job.error_code = "auth_cancelled"
+                return
+            if completed.outcome == "timeout":
+                with self._lock:
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "OpenClaw sign-in timed out"
+                    job.error_code = "auth_timeout"
+                return
+            if completed.outcome != "completed" or completed.returncode != 0:
+                with self._lock:
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "OpenClaw sign-in failed"
+                    job.error_code = "auth_failed"
+                return
+            plans, _, error = self._current_plan_profiles()
+            with self._lock:
+                if plans and not error:
+                    job.state = "success"
+                    job.phase = "complete"
+                    job.message = "OpenAI plan sign-in connected"
+                    job.error_code = ""
+                else:
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "OpenClaw did not confirm an OpenAI plan profile"
+                    job.error_code = "auth_not_confirmed"
+
         try:
             readiness_error = self._gateway_readiness()
             if job.cancel_event.is_set():
@@ -809,54 +871,7 @@ class OpenAIPlanAuthFacade:
                 return
 
             if readiness_error:
-                update_phase("terminal_opened")
-                completed = self._interactive_runner.run(
-                    self._argv(
-                        "models",
-                        "auth",
-                        "login",
-                        "--provider",
-                        "openai",
-                        "--method",
-                        job.method,
-                    ),
-                    timeout=self._auth_timeout,
-                    cancel_event=job.cancel_event,
-                    on_process=remember_process,
-                )
-                if completed.outcome == "cancelled" or job.cancel_event.is_set():
-                    with self._lock:
-                        job.state = "cancelled"
-                        job.phase = "complete"
-                        job.message = "Sign-in cancelled"
-                        job.error_code = "auth_cancelled"
-                    return
-                if completed.outcome == "timeout":
-                    with self._lock:
-                        job.state = "fail"
-                        job.phase = "complete"
-                        job.message = "OpenClaw sign-in timed out"
-                        job.error_code = "auth_timeout"
-                    return
-                if completed.outcome != "completed" or completed.returncode != 0:
-                    with self._lock:
-                        job.state = "fail"
-                        job.phase = "complete"
-                        job.message = "OpenClaw sign-in failed"
-                        job.error_code = "auth_failed"
-                    return
-                plans, _, error = self._current_plan_profiles()
-                with self._lock:
-                    if plans and not error:
-                        job.state = "success"
-                        job.phase = "complete"
-                        job.message = "OpenAI plan sign-in connected"
-                        job.error_code = ""
-                    else:
-                        job.state = "fail"
-                        job.phase = "complete"
-                        job.message = "OpenClaw did not confirm an OpenAI plan profile"
-                        job.error_code = "auth_not_confirmed"
+                run_interactive_fallback()
                 return
 
             sidecar = self._gateway_sidecar_factory()
@@ -868,6 +883,19 @@ class OpenAIPlanAuthFacade:
                 on_phase=update_phase,
                 on_process=remember_process,
             )
+            if (
+                self._platform_name == "nt"
+                and completed.outcome == "failure"
+                and completed.fallback_eligible
+                and completed.error_code not in {"auth_timeout", "auth_cancelled"}
+                and not job.cancel_event.is_set()
+            ):
+                # OpenAIPlanGatewaySidecar returns only after its official
+                # client/process has fully settled.  The internal flag is
+                # emitted before models.authLogin admission and is never
+                # exposed through the Web API.
+                run_interactive_fallback()
+                return
             with self._lock:
                 if completed.outcome == "cancelled" or (
                     job.cancel_event.is_set() and completed.outcome != "success"
