@@ -385,7 +385,10 @@ def test_api_key_is_not_plan_and_mixed_is_explicit():
 
 
 def test_runtime_unavailable_with_mixed_credentials_does_not_require_reauth():
-    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    mixed = json.loads(json.dumps({"profiles": PLAN["profiles"] + API_KEY["profiles"]}))
+    # OpenClaw OAuth profiles expose the refreshable access-token expiry.
+    # That timestamp being in the past is not credential reauth evidence.
+    mixed["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
     runtime_unavailable = status_with_saved_api_key()
     runtime_unavailable["auth"]["runtimeAuthRoutes"][0]["status"] = "unavailable"
 
@@ -434,14 +437,26 @@ def test_status_never_labels_runtime_platform_evidence_as_plan_only(platform_sta
     assert body["errorCode"] == "platform_fallback_present"
 
 
-def test_expired_plan_is_connected_but_requires_reauth():
-    expired = json.loads(json.dumps(PLAN))
-    expired["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
-    body = facade(QueueRunner(result(expired), result(STATUS))).status()
+@pytest.mark.parametrize("evidence", ["expired", "unusable", "reauthRequired"])
+def test_explicit_credential_reauth_evidence_still_requires_reauth(evidence):
+    invalid = json.loads(json.dumps(PLAN))
+    invalid["profiles"][0][evidence] = True
+    body = facade(QueueRunner(result(invalid), result(STATUS))).status()
     assert body["connected"] is True
     assert body["usable"] is False
     assert body["reauthRequired"] is True
     assert body["profiles"][0]["usable"] is False
+
+
+def test_refreshable_oauth_access_expiry_alone_does_not_require_reauth():
+    refreshable = json.loads(json.dumps(PLAN))
+    refreshable["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
+
+    body = facade(QueueRunner(result(refreshable), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is True
 
 
 def test_multiple_plan_profiles_make_public_status_unusable_without_exclusive_proof():

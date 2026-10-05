@@ -17,7 +17,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -271,16 +270,19 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
         if not profile_id:
             continue
         method = row.get("method") if row.get("method") in _ALLOWED_METHODS else "unknown"
-        expires_at = row.get("expiresAt")
-        expired = False
-        if isinstance(expires_at, str):
-            try:
-                expired = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
-            except (TypeError, ValueError):
-                # An explicitly present but malformed expiry is not safe to
-                # treat as healthy.
-                expired = True
-        unusable = bool(row.get("disabledUntil") or row.get("cooldownUntil") or expired)
+        # OpenClaw OAuth rows expose the refreshable access-token expiry as
+        # expiresAt.  A past timestamp does not prove the persisted OAuth
+        # profile needs user reauthentication.  Only explicit credential
+        # validity evidence may drive reauthRequired.
+        reauth_required = any(
+            row.get(field) is True
+            for field in ("expired", "unusable", "reauthRequired", "requiresReauth")
+        )
+        unusable = bool(
+            row.get("disabledUntil")
+            or row.get("cooldownUntil")
+            or reauth_required
+        )
         normalized.append(
             {
                 "id": profile_id,
@@ -289,6 +291,7 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
                 # Only an explicit, allowlisted displayName is public-safe.
                 "display_label": _safe_display_label(row.get("displayName")),
                 "unusable": unusable,
+                "reauth_required": reauth_required,
             }
         )
     return normalized
@@ -695,13 +698,19 @@ class OpenAIPlanAuthFacade:
         active = next((row for row in plans if row["id"] == active_profile_id), plans[0] if len(plans) == 1 else None)
         connected = bool(plans)
         selected_unusable = bool(active["unusable"]) if active else all(bool(row["unusable"]) for row in plans)
+        selected_reauth = (
+            bool(active["reauth_required"])
+            if active
+            else all(bool(row["reauth_required"]) for row in plans)
+        )
         # Credential validity and runtime availability are independent facts.
         # Missing/unavailable routing must not turn a persisted plan profile
         # into a reauthentication request; only credential evidence may do so.
-        reauth = connected and selected_unusable
+        reauth = connected and selected_reauth
         usable = (
             connected
             and runtime_status == "usable"
+            and not selected_unusable
             and not reauth
             and not assessment.error_code
         )
