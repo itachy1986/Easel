@@ -274,10 +274,15 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
         # expiresAt.  A past timestamp does not prove the persisted OAuth
         # profile needs user reauthentication.  Only explicit credential
         # validity evidence may drive reauthRequired.
+        disabled_reason = _safe_text(row.get("disabledReason"), 64).lower()
+        cooldown_reason = _safe_text(row.get("cooldownReason"), 64).lower()
         reauth_required = any(
             row.get(field) is True
             for field in ("expired", "unusable", "reauthRequired", "requiresReauth")
-        )
+        ) or disabled_reason == "auth_permanent" or cooldown_reason in {
+            "auth_permanent",
+            "session_expired",
+        }
         unusable = bool(
             row.get("disabledUntil")
             or row.get("cooldownUntil")

@@ -437,7 +437,7 @@ def test_status_never_labels_runtime_platform_evidence_as_plan_only(platform_sta
     assert body["errorCode"] == "platform_fallback_present"
 
 
-@pytest.mark.parametrize("evidence", ["expired", "unusable", "reauthRequired"])
+@pytest.mark.parametrize("evidence", ["expired", "unusable", "reauthRequired", "requiresReauth"])
 def test_explicit_credential_reauth_evidence_still_requires_reauth(evidence):
     invalid = json.loads(json.dumps(PLAN))
     invalid["profiles"][0][evidence] = True
@@ -455,6 +455,100 @@ def test_refreshable_oauth_access_expiry_alone_does_not_require_reauth():
     body = facade(QueueRunner(result(refreshable), result(STATUS))).status()
 
     assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is True
+
+
+def test_openclaw_auth_cooldown_for_refreshable_wham_token_does_not_require_reauth():
+    refreshable = json.loads(json.dumps(PLAN))
+    refreshable["profiles"][0].update(
+        {
+            "expiresAt": "2000-01-01T00:00:00Z",
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth",
+            "cooldownClassification": "wham_token_expired",
+        }
+    )
+
+    body = facade(QueueRunner(result(refreshable), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+@pytest.mark.parametrize(
+    "reason_evidence",
+    [
+        {"disabledUntil": 4102444800000, "disabledReason": "auth_permanent"},
+        {
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth_permanent",
+            "cooldownClassification": "wham_account_dead",
+        },
+        {"cooldownUntil": 4102444800000, "cooldownReason": "session_expired"},
+    ],
+)
+def test_openclaw_permanent_or_session_expired_reason_requires_reauth(reason_evidence):
+    invalid = json.loads(json.dumps(PLAN))
+    invalid["profiles"][0].update(reason_evidence)
+
+    body = facade(QueueRunner(result(invalid), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is True
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+@pytest.mark.parametrize(
+    "usage_evidence",
+    [
+        {"cooldownUntil": 4102444800000, "cooldownReason": "billing"},
+        {"disabledUntil": 4102444800000, "disabledReason": "billing"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "rate_limit"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "timeout"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "overloaded"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "model_not_found"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "empty_response"},
+        {"cooldownUntil": 4102444800000},
+    ],
+)
+def test_openclaw_non_auth_usage_state_is_unusable_without_reauth(usage_evidence):
+    cooling_down = json.loads(json.dumps(PLAN))
+    cooling_down["profiles"][0].update(usage_evidence)
+
+    body = facade(QueueRunner(result(cooling_down), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+def test_wham_account_dead_classification_does_not_override_non_permanent_reason():
+    contradictory = json.loads(json.dumps(PLAN))
+    contradictory["profiles"][0].update(
+        {
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth",
+            "cooldownClassification": "wham_account_dead",
+        }
+    )
+
+    body = facade(QueueRunner(result(contradictory), result(STATUS))).status()
+
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+
+
+def test_recovery_hint_text_is_not_used_as_reauth_evidence():
+    hint_only = json.loads(json.dumps(PLAN))
+    hint_only["profiles"][0]["recoveryHint"] = "Please re-authenticate this account"
+
+    body = facade(QueueRunner(result(hint_only), result(STATUS))).status()
+
     assert body["reauthRequired"] is False
     assert body["usable"] is True
 
