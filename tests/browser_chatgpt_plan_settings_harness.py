@@ -269,6 +269,7 @@ def run_matrix() -> None:
         )
 
         def platform_only_check(page: Page, api: MockPlanApi) -> None:
+            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("Platform API")
             expect(page.get_by_test_id("plan-risk")).to_contain_text("你仍可登录 ChatGPT Plan")
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_be_enabled()
             expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
@@ -464,12 +465,14 @@ def run_matrix() -> None:
             displayLabel="ChatGPT Plan account",
         )
         with_scenario(browser, MockPlanApi(statuses=[reauth]), lambda page, _api: (
+            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("需要重新登录"),
             expect(page.get_by_test_id("plan-status-copy")).to_contain_text("需要重新登录"),
             expect(page.get_by_role("button", name="重新登录 ChatGPT")).to_be_visible(),
         ))
 
         # 6. Exclusive usable plan gets only the allowlisted OpenAI catalog.
         def usable(page: Page, _api: MockPlanApi) -> None:
+            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("Connected")
             select = page.get_by_test_id("plan-model-select")
             expect(select).to_be_visible()
             expect(select.locator("option")).to_have_count(2)
@@ -490,7 +493,7 @@ def run_matrix() -> None:
         def mixed_check(page: Page, api: MockPlanApi) -> None:
             expect(page.get_by_test_id("plan-risk")).to_contain_text("意外 API 计费")
             expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
-            expect(page.locator(".chatgpt-plan-head .pill")).to_contain_text("需检查")
+            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("已登录 · 需检查")
             expect(page.get_by_role("button", name="重新登录 ChatGPT")).to_have_count(0)
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_have_count(0)
             expect(page.get_by_role("button", name="Test & use")).to_have_count(0)

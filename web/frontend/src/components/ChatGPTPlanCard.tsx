@@ -40,7 +40,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
     if (isExclusivePlanUsable(status)) return { cls: 'ok', label: 'Connected' };
     if (status?.reauthRequired) return { cls: 'warn', label: '需要重新登录' };
     if (status?.billingSource === 'platform_api') return { cls: 'warn', label: 'Platform API' };
-    if (status?.connected) return { cls: 'warn', label: '需检查' };
+    if (status?.connected) return { cls: 'warn', label: '已登录 · 需检查' };
     if (status?.available === false) return { cls: 'fail', label: '状态不可用' };
     return { cls: 'off', label: '未登录' };
   })();
