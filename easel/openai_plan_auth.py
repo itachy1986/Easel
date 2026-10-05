@@ -8,6 +8,7 @@ never reads an auth database or stores OAuth material.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -16,11 +17,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from easel.gateway_endpoint import websocket_url
 from easel.openclaw_cmd import openclaw_base_cmd
+from easel.openai_plan_gateway import (
+    OpenAIPlanGatewaySidecar,
+    ensure_gateway_ready,
+    probe_gateway_ready,
+)
 
 
 _ALLOWED_METHODS = frozenset({"siwc", "oauth", "device-code"})
@@ -30,6 +36,10 @@ _PUBLIC_HANDLE_RE = re.compile(r"^plan_[0-9a-f]{32}$")
 _MODEL_REF_RE = re.compile(r"^openai/([A-Za-z0-9][A-Za-z0-9._:+\-]{0,127})$")
 _FINAL_JOB_STATES = frozenset({"interaction_required", "success", "fail", "cancelled"})
 _TEST_PROMPT = "Reply with exactly OK."
+_MANUAL_LOGIN_COMMANDS = {
+    "siwc": "openclaw --profile easel models auth login --provider openai --method siwc",
+    "oauth": "openclaw --profile easel models auth login --provider openai --method oauth",
+}
 
 
 class InvalidRequestError(ValueError):
@@ -154,13 +164,69 @@ class BoundedProcessRunner:
         )
 
 
+class InteractiveAuthProcessRunner:
+    """Run one visible OpenClaw auth child without observing terminal I/O."""
+
+    def __init__(self, *, cwd: Path | None = None):
+        self.cwd = str(cwd) if cwd else None
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float,
+        cancel_event: threading.Event,
+        on_process: Callable[[subprocess.Popen[Any]], None] | None = None,
+    ) -> ProcessResult:
+        if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
+            raise TypeError("argv must be a non-empty list of strings")
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+        proc = subprocess.Popen(
+            argv,
+            cwd=self.cwd,
+            shell=False,
+            creationflags=creationflags,
+        )
+        if on_process:
+            on_process(proc)
+
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        outcome = "completed"
+        while proc.poll() is None:
+            if cancel_event.is_set():
+                outcome = "cancelled"
+                BoundedProcessRunner._stop_process(proc)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                outcome = "timeout"
+                BoundedProcessRunner._stop_process(proc)
+                break
+            try:
+                proc.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        return ProcessResult(
+            int(proc.returncode if proc.returncode is not None else -1),
+            "",
+            "",
+            outcome,
+        )
+
+
 @dataclass
 class _Job:
     job_id: str
     method: str
     state: str = "running"
+    phase: str = "gateway_starting"
     message: str = "Waiting for OpenClaw sign-in"
     error_code: str = ""
+    terminal_command: str = ""
     started_at: int = field(default_factory=lambda: int(time.time()))
     ended_at: int | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -204,16 +270,24 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
         if not profile_id:
             continue
         method = row.get("method") if row.get("method") in _ALLOWED_METHODS else "unknown"
-        expires_at = row.get("expiresAt")
-        expired = False
-        if isinstance(expires_at, str):
-            try:
-                expired = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
-            except (TypeError, ValueError):
-                # An explicitly present but malformed expiry is not safe to
-                # treat as healthy.
-                expired = True
-        unusable = bool(row.get("disabledUntil") or row.get("cooldownUntil") or expired)
+        # OpenClaw OAuth rows expose the refreshable access-token expiry as
+        # expiresAt.  A past timestamp does not prove the persisted OAuth
+        # profile needs user reauthentication.  Only explicit credential
+        # validity evidence may drive reauthRequired.
+        disabled_reason = _safe_text(row.get("disabledReason"), 64).lower()
+        cooldown_reason = _safe_text(row.get("cooldownReason"), 64).lower()
+        reauth_required = any(
+            row.get(field) is True
+            for field in ("expired", "unusable", "reauthRequired", "requiresReauth")
+        ) or disabled_reason == "auth_permanent" or cooldown_reason in {
+            "auth_permanent",
+            "session_expired",
+        }
+        unusable = bool(
+            row.get("disabledUntil")
+            or row.get("cooldownUntil")
+            or reauth_required
+        )
         normalized.append(
             {
                 "id": profile_id,
@@ -222,6 +296,7 @@ def _plan_profiles(payload: Any) -> list[dict[str, str | bool]]:
                 # Only an explicit, allowlisted displayName is public-safe.
                 "display_label": _safe_display_label(row.get("displayName")),
                 "unusable": unusable,
+                "reauth_required": reauth_required,
             }
         )
     return normalized
@@ -457,20 +532,48 @@ class OpenAIPlanAuthFacade:
         cwd: Path | None = None,
         auth_timeout: float = 600,
         command_timeout: float = 30,
+        cold_start_retry_timeout: float = 45,
         test_timeout: float = 120,
         max_jobs: int = 32,
         workspace_factory: Callable[[], Any] | None = None,
+        gateway_sidecar_factory: Callable[[], Any] | None = None,
+        gateway_readiness: Callable[[], str] | None = None,
+        gateway_ready_probe: Callable[[], bool] | None = None,
+        interactive_runner: Any | None = None,
+        platform_name: str | None = None,
     ):
         self.profile = profile
         self._base_cmd_factory = base_cmd_factory
         self._runner = runner or BoundedProcessRunner(cwd=cwd)
         self._auth_timeout = auth_timeout
         self._command_timeout = command_timeout
+        self._cold_start_retry_timeout = max(
+            float(command_timeout),
+            float(cold_start_retry_timeout),
+        )
         self._test_timeout = test_timeout
         self._max_jobs = max(4, int(max_jobs))
+        self._cwd = Path(cwd).resolve() if cwd else Path(__file__).resolve().parents[1]
         self._workspace_factory = workspace_factory or (
             lambda: tempfile.TemporaryDirectory(prefix="easel-openai-plan-test-")
         )
+        self._gateway_sidecar_factory = gateway_sidecar_factory or (
+            lambda: OpenAIPlanGatewaySidecar(
+                profile=self.profile,
+                cwd=self._cwd,
+                base_cmd_factory=self._base_cmd_factory,
+                gateway_url_factory=lambda: websocket_url(self.profile),
+            )
+        )
+        self._platform_name = platform_name or os.name
+        if gateway_readiness is not None:
+            self._gateway_readiness = gateway_readiness
+        elif self._platform_name == "nt":
+            ready_probe = gateway_ready_probe or probe_gateway_ready
+            self._gateway_readiness = lambda: "" if ready_probe() else "gateway_unavailable"
+        else:
+            self._gateway_readiness = lambda: ensure_gateway_ready(cwd=self._cwd)
+        self._interactive_runner = interactive_runner or InteractiveAuthProcessRunner(cwd=self._cwd)
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.RLock()
         self._profile_handles: dict[str, tuple[str, tuple[str, str, str, bool]]] = {}
@@ -498,6 +601,15 @@ class OpenAIPlanAuthFacade:
         except (json.JSONDecodeError, TypeError):
             return None, "invalid_cli_json"
         return payload, ""
+
+    def _run_json_readonly_with_cold_start_retry(
+        self,
+        parts: list[str],
+    ) -> tuple[Any | None, str]:
+        payload, error = self._run_json(parts)
+        if error != "cli_timeout":
+            return payload, error
+        return self._run_json(parts, timeout=self._cold_start_retry_timeout)
 
     def _auth_payload(self) -> tuple[Any | None, str]:
         return self._run_json(["models", "auth", "list", "--provider", "openai", "--json"])
@@ -557,7 +669,10 @@ class OpenAIPlanAuthFacade:
             return profile_id
 
     def status(self) -> dict[str, Any]:
-        plans, auth_payload, auth_error = self._current_plan_profiles()
+        auth_payload, auth_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "auth", "list", "--provider", "openai", "--json"]
+        )
+        plans = _plan_profiles(auth_payload)
         if auth_error:
             self._publish_profile_handles([])
             return {
@@ -577,7 +692,9 @@ class OpenAIPlanAuthFacade:
                 "profiles": [],
             }
 
-        status_payload, status_error = self._run_json(["models", "status", "--json"])
+        status_payload, status_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "status", "--json"]
+        )
         assessment = _credential_assessment(auth_payload, status_payload, plans)
         active_profile_id = assessment.active_profile_id
         runtime_status = assessment.runtime_status
@@ -586,10 +703,19 @@ class OpenAIPlanAuthFacade:
         active = next((row for row in plans if row["id"] == active_profile_id), plans[0] if len(plans) == 1 else None)
         connected = bool(plans)
         selected_unusable = bool(active["unusable"]) if active else all(bool(row["unusable"]) for row in plans)
-        reauth = connected and (selected_unusable or runtime_status in {"missing", "unavailable"})
+        selected_reauth = (
+            bool(active["reauth_required"])
+            if active
+            else all(bool(row["reauth_required"]) for row in plans)
+        )
+        # Credential validity and runtime availability are independent facts.
+        # Missing/unavailable routing must not turn a persisted plan profile
+        # into a reauthentication request; only credential evidence may do so.
+        reauth = connected and selected_reauth
         usable = (
             connected
             and runtime_status == "usable"
+            and not selected_unusable
             and not reauth
             and not assessment.error_code
         )
@@ -640,11 +766,14 @@ class OpenAIPlanAuthFacade:
             "jobId": job.job_id,
             "state": job.state,
             "method": job.method,
+            "phase": job.phase,
             "message": job.message,
             "errorCode": job.error_code,
         }
         if job.method == "device-code":
             response["deviceCodeWebSupported"] = False
+        if job.terminal_command:
+            response["terminalCommand"] = job.terminal_command
         return response
 
     def start_connect(self, method: str) -> dict[str, Any]:
@@ -658,6 +787,7 @@ class OpenAIPlanAuthFacade:
             self._jobs[job.job_id] = job
             if method == "device-code":
                 job.state = "interaction_required"
+                job.phase = "complete"
                 job.message = "Device-code sign-in is available from the OpenClaw terminal"
                 job.error_code = "device_code_terminal_only"
                 job.ended_at = int(time.time())
@@ -667,50 +797,156 @@ class OpenAIPlanAuthFacade:
             return self._public_job(job)
 
     def _run_auth_job(self, job: _Job) -> None:
-        def remember_process(proc: subprocess.Popen[bytes]) -> None:
+        def remember_process(proc: subprocess.Popen[Any]) -> None:
             with self._lock:
                 job.process = proc
 
-        try:
-            completed = self._runner.run(
-                self._argv("models", "auth", "login", "--provider", "openai", "--method", job.method),
+        def update_phase(phase: str) -> None:
+            messages = {
+                "gateway_connecting": "Connecting to the local OpenClaw Gateway",
+                "waiting": "Waiting for OpenClaw sign-in",
+                "browser_opened": "Browser opened for OpenClaw sign-in",
+                "terminal_opened": "OpenClaw interactive sign-in window opened",
+            }
+            if phase not in messages:
+                return
+            with self._lock:
+                if job.state == "running":
+                    job.phase = phase
+                    job.message = messages[phase]
+
+        def run_interactive_fallback() -> None:
+            update_phase("terminal_opened")
+            completed = self._interactive_runner.run(
+                self._argv(
+                    "models",
+                    "auth",
+                    "login",
+                    "--provider",
+                    "openai",
+                    "--method",
+                    job.method,
+                ),
                 timeout=self._auth_timeout,
                 cancel_event=job.cancel_event,
                 on_process=remember_process,
             )
-            with self._lock:
-                if completed.outcome == "cancelled" or job.cancel_event.is_set():
+            if completed.outcome == "cancelled" or job.cancel_event.is_set():
+                with self._lock:
                     job.state = "cancelled"
+                    job.phase = "complete"
                     job.message = "Sign-in cancelled"
                     job.error_code = "auth_cancelled"
-                elif completed.outcome == "timeout":
+                return
+            if completed.outcome == "timeout":
+                with self._lock:
                     job.state = "fail"
+                    job.phase = "complete"
                     job.message = "OpenClaw sign-in timed out"
                     job.error_code = "auth_timeout"
-                elif completed.returncode != 0:
+                return
+            if completed.outcome != "completed" or completed.returncode != 0:
+                with self._lock:
                     job.state = "fail"
+                    job.phase = "complete"
                     job.message = "OpenClaw sign-in failed"
                     job.error_code = "auth_failed"
+                return
+            plans, _, error = self._current_plan_profiles()
+            with self._lock:
+                if plans and not error:
+                    job.state = "success"
+                    job.phase = "complete"
+                    job.message = "OpenAI plan sign-in connected"
+                    job.error_code = ""
+                else:
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "OpenClaw did not confirm an OpenAI plan profile"
+                    job.error_code = "auth_not_confirmed"
+
+        try:
+            readiness_error = self._gateway_readiness()
+            if job.cancel_event.is_set():
+                with self._lock:
+                    job.state = "cancelled"
+                    job.phase = "complete"
+                    job.message = "Sign-in cancelled"
+                    job.error_code = "auth_cancelled"
+                return
+
+            if readiness_error and self._platform_name != "nt":
+                with self._lock:
+                    job.state = "interaction_required"
+                    job.phase = "complete"
+                    job.message = "Run the OpenClaw login command in a local terminal"
+                    job.error_code = "gateway_unavailable"
+                    job.terminal_command = _MANUAL_LOGIN_COMMANDS[job.method]
+                return
+
+            if readiness_error:
+                run_interactive_fallback()
+                return
+
+            sidecar = self._gateway_sidecar_factory()
+            completed = sidecar.run(
+                method=job.method,
+                session_id=secrets.token_urlsafe(24),
+                timeout=self._auth_timeout,
+                cancel_event=job.cancel_event,
+                on_phase=update_phase,
+                on_process=remember_process,
+            )
+            if (
+                self._platform_name == "nt"
+                and completed.outcome == "failure"
+                and completed.fallback_eligible
+                and completed.error_code not in {"auth_timeout", "auth_cancelled"}
+                and not job.cancel_event.is_set()
+            ):
+                # OpenAIPlanGatewaySidecar returns only after its official
+                # client/process has fully settled.  The internal flag is
+                # emitted before models.authLogin admission and is never
+                # exposed through the Web API.
+                run_interactive_fallback()
+                return
+            with self._lock:
+                if completed.outcome == "cancelled" or (
+                    job.cancel_event.is_set() and completed.outcome != "success"
+                ):
+                    job.state = "cancelled"
+                    job.phase = "complete"
+                    job.message = "Sign-in cancelled"
+                    job.error_code = "auth_cancelled"
+                elif completed.outcome != "success":
+                    job.state = "fail"
+                    job.phase = "complete"
+                    job.message = "OpenClaw sign-in failed"
+                    job.error_code = completed.error_code or "gateway_rpc_failed"
                 else:
                     # Success is confirmed from a fresh safe auth listing, never
-                    # from potentially sensitive interactive command output.
+                    # from the Wizard terminal event alone.
                     plans, _, error = self._current_plan_profiles()
                     if plans and not error:
                         job.state = "success"
+                        job.phase = "complete"
                         job.message = "OpenAI plan sign-in connected"
                         job.error_code = ""
                     else:
                         job.state = "fail"
+                        job.phase = "complete"
                         job.message = "OpenClaw did not confirm an OpenAI plan profile"
                         job.error_code = "auth_not_confirmed"
         except Exception:  # noqa: BLE001 - expose only a bounded generic state
             with self._lock:
                 if job.cancel_event.is_set():
                     job.state = "cancelled"
+                    job.phase = "complete"
                     job.message = "Sign-in cancelled"
                     job.error_code = "auth_cancelled"
                 else:
                     job.state = "fail"
+                    job.phase = "complete"
                     job.message = "OpenClaw sign-in could not be started"
                     job.error_code = "auth_process_error"
         finally:
@@ -732,9 +968,6 @@ class OpenAIPlanAuthFacade:
                 raise JobNotFoundError("auth_job_not_found")
             if job.state == "running":
                 job.cancel_event.set()
-                proc = job.process
-                if proc is not None:
-                    BoundedProcessRunner._stop_process(proc)
             return self._public_job(job)
 
     def _catalog(self) -> dict[str, Any]:
@@ -923,8 +1156,10 @@ class OpenAIPlanAuthFacade:
             running = [job for job in self._jobs.values() if job.state == "running"]
             for job in running:
                 job.cancel_event.set()
-                if job.process is not None:
-                    BoundedProcessRunner._stop_process(job.process)
             threads = [job.thread for job in running if job.thread is not None]
         for thread in threads:
             thread.join(timeout=5)
+        with self._lock:
+            remaining = [job.process for job in running if job.process is not None]
+        for proc in remaining:
+            BoundedProcessRunner._stop_process(proc)

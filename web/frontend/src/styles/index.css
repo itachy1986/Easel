@@ -1313,6 +1313,55 @@ textarea.field { resize: vertical; min-height: 90px; }
 }
 .settings-overlay .adv-btn:hover { color: var(--text); border-color: var(--text); }
 
+/* ChatGPT Plan：OpenClaw 管理的订阅登录，与下方 API/provider 配置严格分区。 */
+.settings-overlay .chatgpt-plan {
+  margin: 0 0 16px; border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--surface); box-shadow: 0 1px 3px rgba(23,25,28,.05); overflow: hidden;
+}
+.settings-overlay .chatgpt-plan-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+  padding: 14px 16px 12px; background: var(--surface-2); border-bottom: 1px solid var(--border);
+}
+.settings-overlay .chatgpt-plan-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
+.settings-overlay .chatgpt-plan-head p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 12.5px; line-height: 1.5; }
+.settings-overlay .chatgpt-plan-body { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 13px 16px 14px; }
+.settings-overlay .chatgpt-plan-status { display: flex; align-items: baseline; gap: 9px; font-size: 12.5px; }
+.settings-overlay .chatgpt-plan-status span { color: var(--text-tertiary); }
+.settings-overlay .plan-notice { width: 100%; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; line-height: 1.5; background: var(--surface-2); color: var(--text-secondary); }
+.settings-overlay .plan-notice.ok { background: var(--green-soft); color: var(--green); }
+.settings-overlay .plan-notice.warn, .settings-overlay .plan-notice.risk { background: var(--amber-soft); color: var(--text); }
+.settings-overlay .plan-notice.error { background: var(--red-soft); color: var(--red); }
+.settings-overlay .plan-connect { display: flex; width: 100%; align-items: center; gap: 9px; color: var(--text-secondary); font-size: 12.5px; }
+.settings-overlay .plan-connect .btn { margin-left: auto; }
+.settings-overlay .plan-model-row { display: grid; width: 100%; grid-template-columns: auto minmax(220px, 1fr) auto; align-items: center; gap: 10px; }
+.settings-overlay .plan-model-row label { font-size: 12.5px; font-weight: 600; }
+.settings-overlay .plan-model-row select {
+  min-width: 0; width: 100%; padding: 6px 9px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; font-size: 12.5px;
+}
+.settings-overlay .plan-model-row select:focus { outline: none; border-color: var(--accent-end); box-shadow: 0 0 0 3px rgba(63,86,168,.1); }
+.settings-overlay .plan-catalog-state { color: var(--text-secondary); font-size: 12.5px; }
+.settings-overlay .plan-compat { width: 100%; border-top: 1px solid var(--border); padding-top: 9px; }
+.settings-overlay .plan-compat summary { width: max-content; color: var(--accent-end); font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.settings-overlay .plan-compat-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0 0; }
+.settings-overlay .plan-compat-row + .plan-compat-row { margin-top: 10px; border-top: 1px solid var(--border); }
+.settings-overlay .plan-compat-row strong { font-size: 12.5px; }
+.settings-overlay .plan-compat-row p { margin: 2px 0 0; color: var(--text-tertiary); font-size: 11.5px; line-height: 1.45; }
+.settings-overlay .plan-command { display: flex; flex: 0 1 520px; align-items: center; gap: 7px; min-width: 0; }
+.settings-overlay .plan-command input { flex: 1 1 auto; min-width: 0; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--text-secondary); font: 11px/1.4 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+.settings-overlay .plan-command span { color: var(--green); font-size: 11.5px; white-space: nowrap; }
+.settings-overlay .plan-separation { margin: 0; color: var(--text-tertiary); font-size: 11.5px; line-height: 1.5; }
+.settings-overlay .plan-provider-heading { display: flex; align-items: baseline; gap: 9px; margin: 0 0 8px; }
+.settings-overlay .plan-provider-heading strong { font-size: 12.5px; }
+.settings-overlay .plan-provider-heading span { color: var(--text-tertiary); font-size: 11.5px; }
+
+@media (max-width: 760px) {
+  .settings-overlay .chatgpt-plan-head, .settings-overlay .plan-compat-row { align-items: stretch; flex-direction: column; }
+  .settings-overlay .plan-model-row { grid-template-columns: 1fr; }
+  .settings-overlay .plan-command { flex-basis: auto; width: 100%; flex-wrap: wrap; }
+  .settings-overlay .plan-command input { flex-basis: 100%; }
+}
+
 
 /* 本机 Agent 区块（设置 → 对话与脚本）：贴在本机装了 CLI agent 的提示与一键接入。
    grid 对齐上面的 prow，但列数更少（名称/状态/操作/说明）。 */

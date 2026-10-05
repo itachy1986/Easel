@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import threading
 import time
 from contextlib import nullcontext
@@ -11,10 +12,12 @@ import pytest
 from easel.openai_plan_auth import (
     ActiveJobError,
     BoundedProcessRunner,
+    InteractiveAuthProcessRunner,
     InvalidRequestError,
     OpenAIPlanAuthFacade,
     ProcessResult,
 )
+from easel.openai_plan_gateway import GatewaySidecarResult
 
 
 PLAN = {
@@ -171,6 +174,55 @@ def wait_done(auth, job_id, timeout=2):
     raise AssertionError("job did not finish")
 
 
+class FakeGatewaySidecar:
+    def __init__(self, result=GatewaySidecarResult("success", ""), *, block=False):
+        self.result = result
+        self.block = block
+        self.started = threading.Event()
+        self.calls = []
+
+    def run(self, *, method, session_id, timeout, cancel_event, on_phase, on_process):
+        self.calls.append(
+            {
+                "method": method,
+                "sessionId": session_id,
+                "timeout": timeout,
+                "cancelEvent": cancel_event,
+            }
+        )
+        self.started.set()
+        on_phase("gateway_connecting")
+        if self.block:
+            cancel_event.wait(2)
+            return GatewaySidecarResult("cancelled", "auth_cancelled")
+        on_phase("browser_opened")
+        return self.result
+
+
+class FakeInteractiveRunner:
+    def __init__(self, result=ProcessResult(0, "", "", "completed"), *, block=False):
+        self.result = result
+        self.block = block
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = []
+
+    def run(self, argv, *, timeout, cancel_event, on_process):
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "timeout": timeout,
+                "cancelEvent": cancel_event,
+            }
+        )
+        self.started.set()
+        if self.block:
+            while not self.release.wait(0.01):
+                if cancel_event.is_set():
+                    return ProcessResult(-1, "", "", "cancelled")
+        return self.result
+
+
 def test_status_normalizes_plan_without_raw_or_secrets():
     raw_plan = json.loads(json.dumps(PLAN))
     raw_plan["profiles"][0].update(
@@ -213,6 +265,111 @@ def test_status_normalizes_plan_without_raw_or_secrets():
         assert sentinel not in encoded
 
 
+def test_status_retries_auth_list_timeout_once_with_cold_start_budget():
+    runner = QueueRunner(
+        ProcessResult(-1, "", "", "timeout"),
+        result(PLAN),
+        result(STATUS),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is True
+    assert [call[1] for call in runner.calls] == [30, 45, 30]
+    assert runner.calls[0][0][-6:] == [
+        "models", "auth", "list", "--provider", "openai", "--json",
+    ]
+    assert runner.calls[1][0] == runner.calls[0][0]
+
+
+def test_status_retries_models_status_timeout_once_with_cold_start_budget():
+    runner = QueueRunner(
+        result(PLAN),
+        ProcessResult(-1, "", "", "timeout"),
+        result(STATUS),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is True
+    assert [call[1] for call in runner.calls] == [30, 30, 45]
+    assert runner.calls[1][0][-3:] == ["models", "status", "--json"]
+    assert runner.calls[2][0] == runner.calls[1][0]
+
+
+def test_status_retries_timeout_only_once_and_keeps_public_failure_bounded():
+    runner = QueueRunner(
+        ProcessResult(-1, "ACCESS_SENTINEL", "Authorization: Bearer SECRET", "timeout"),
+        ProcessResult(-1, "REFRESH_SENTINEL", "AUTH_STATE_PATH_SENTINEL", "timeout"),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == "cli_timeout"
+    assert [call[1] for call in runner.calls] == [30, 45]
+    encoded = json.dumps(body)
+    for sentinel in (
+        "ACCESS_SENTINEL", "Authorization", "SECRET",
+        "REFRESH_SENTINEL", "AUTH_STATE_PATH_SENTINEL",
+    ):
+        assert sentinel not in encoded
+
+
+@pytest.mark.parametrize(
+    ("process_result", "error_code"),
+    [
+        (ProcessResult(1, "ACCESS_SENTINEL", "SECRET", "completed"), "cli_failed"),
+        (ProcessResult(0, "not-json ACCESS_SENTINEL", "SECRET", "completed"), "invalid_cli_json"),
+    ],
+)
+def test_status_does_not_retry_non_timeout_readonly_failures(process_result, error_code):
+    runner = QueueRunner(process_result)
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == error_code
+    assert [call[1] for call in runner.calls] == [30]
+    assert "ACCESS_SENTINEL" not in json.dumps(body)
+    assert "SECRET" not in json.dumps(body)
+
+
+def test_status_does_not_retry_cli_unavailable():
+    def unavailable(_argv, _cancel):
+        raise OSError("ACCESS_SENTINEL SECRET")
+
+    runner = QueueRunner(unavailable)
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).status()
+
+    assert body["available"] is False
+    assert body["errorCode"] == "cli_unavailable"
+    assert [call[1] for call in runner.calls] == [30]
+    assert "ACCESS_SENTINEL" not in json.dumps(body)
+    assert "SECRET" not in json.dumps(body)
+
+
 def test_api_key_is_not_plan_and_mixed_is_explicit():
     auth = facade(QueueRunner(result(API_KEY), result(STATUS)))
     only_key = auth.status()
@@ -225,6 +382,39 @@ def test_api_key_is_not_plan_and_mixed_is_explicit():
     assert body["connected"] is True
     assert body["billingSource"] == "mixed"
     assert body["activeProfileHandle"].startswith("plan_")
+
+
+def test_runtime_unavailable_with_mixed_credentials_does_not_require_reauth():
+    mixed = json.loads(json.dumps({"profiles": PLAN["profiles"] + API_KEY["profiles"]}))
+    # OpenClaw OAuth profiles expose the refreshable access-token expiry.
+    # That timestamp being in the past is not credential reauth evidence.
+    mixed["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
+    runtime_unavailable = status_with_saved_api_key()
+    runtime_unavailable["auth"]["runtimeAuthRoutes"][0]["status"] = "unavailable"
+
+    body = facade(QueueRunner(result(mixed), result(runtime_unavailable))).status()
+
+    assert body["available"] is True
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["runtimeStatus"] == "unavailable"
+    assert body["billingSource"] == "mixed"
+    assert body["errorCode"] == "platform_fallback_present"
+    assert body["recoveryAction"] == "review_openai_billing_sources"
+
+
+def test_runtime_missing_alone_does_not_require_reauth():
+    runtime_missing = json.loads(json.dumps(STATUS))
+    runtime_missing["auth"]["runtimeAuthRoutes"][0]["status"] = "missing"
+
+    body = facade(QueueRunner(result(PLAN), result(runtime_missing))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["runtimeStatus"] == "missing"
+    assert body["recoveryAction"] != "reauthenticate"
 
 
 @pytest.mark.parametrize(
@@ -247,14 +437,120 @@ def test_status_never_labels_runtime_platform_evidence_as_plan_only(platform_sta
     assert body["errorCode"] == "platform_fallback_present"
 
 
-def test_expired_plan_is_connected_but_requires_reauth():
-    expired = json.loads(json.dumps(PLAN))
-    expired["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
-    body = facade(QueueRunner(result(expired), result(STATUS))).status()
+@pytest.mark.parametrize("evidence", ["expired", "unusable", "reauthRequired", "requiresReauth"])
+def test_explicit_credential_reauth_evidence_still_requires_reauth(evidence):
+    invalid = json.loads(json.dumps(PLAN))
+    invalid["profiles"][0][evidence] = True
+    body = facade(QueueRunner(result(invalid), result(STATUS))).status()
     assert body["connected"] is True
     assert body["usable"] is False
     assert body["reauthRequired"] is True
     assert body["profiles"][0]["usable"] is False
+
+
+def test_refreshable_oauth_access_expiry_alone_does_not_require_reauth():
+    refreshable = json.loads(json.dumps(PLAN))
+    refreshable["profiles"][0]["expiresAt"] = "2000-01-01T00:00:00Z"
+
+    body = facade(QueueRunner(result(refreshable), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is True
+
+
+def test_openclaw_auth_cooldown_for_refreshable_wham_token_does_not_require_reauth():
+    refreshable = json.loads(json.dumps(PLAN))
+    refreshable["profiles"][0].update(
+        {
+            "expiresAt": "2000-01-01T00:00:00Z",
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth",
+            "cooldownClassification": "wham_token_expired",
+        }
+    )
+
+    body = facade(QueueRunner(result(refreshable), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+@pytest.mark.parametrize(
+    "reason_evidence",
+    [
+        {"disabledUntil": 4102444800000, "disabledReason": "auth_permanent"},
+        {
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth_permanent",
+            "cooldownClassification": "wham_account_dead",
+        },
+        {"cooldownUntil": 4102444800000, "cooldownReason": "session_expired"},
+    ],
+)
+def test_openclaw_permanent_or_session_expired_reason_requires_reauth(reason_evidence):
+    invalid = json.loads(json.dumps(PLAN))
+    invalid["profiles"][0].update(reason_evidence)
+
+    body = facade(QueueRunner(result(invalid), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is True
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+@pytest.mark.parametrize(
+    "usage_evidence",
+    [
+        {"cooldownUntil": 4102444800000, "cooldownReason": "billing"},
+        {"disabledUntil": 4102444800000, "disabledReason": "billing"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "rate_limit"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "timeout"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "overloaded"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "model_not_found"},
+        {"cooldownUntil": 4102444800000, "cooldownReason": "empty_response"},
+        {"cooldownUntil": 4102444800000},
+    ],
+)
+def test_openclaw_non_auth_usage_state_is_unusable_without_reauth(usage_evidence):
+    cooling_down = json.loads(json.dumps(PLAN))
+    cooling_down["profiles"][0].update(usage_evidence)
+
+    body = facade(QueueRunner(result(cooling_down), result(STATUS))).status()
+
+    assert body["connected"] is True
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+    assert body["profiles"][0]["usable"] is False
+
+
+def test_wham_account_dead_classification_does_not_override_non_permanent_reason():
+    contradictory = json.loads(json.dumps(PLAN))
+    contradictory["profiles"][0].update(
+        {
+            "cooldownUntil": 4102444800000,
+            "cooldownReason": "auth",
+            "cooldownClassification": "wham_account_dead",
+        }
+    )
+
+    body = facade(QueueRunner(result(contradictory), result(STATUS))).status()
+
+    assert body["reauthRequired"] is False
+    assert body["usable"] is False
+
+
+def test_recovery_hint_text_is_not_used_as_reauth_evidence():
+    hint_only = json.loads(json.dumps(PLAN))
+    hint_only["profiles"][0]["recoveryHint"] = "Please re-authenticate this account"
+
+    body = facade(QueueRunner(result(hint_only), result(STATUS))).status()
+
+    assert body["reauthRequired"] is False
+    assert body["usable"] is True
 
 
 def test_multiple_plan_profiles_make_public_status_unusable_without_exclusive_proof():
@@ -387,40 +683,36 @@ def test_connect_rejects_non_allowlisted_methods(method):
 
 
 @pytest.mark.parametrize("method", ["siwc", "oauth"])
-def test_connect_uses_exact_safe_argv_and_never_exposes_raw_output(method):
-    runner = QueueRunner(
-        ProcessResult(0, "ACCESS_SENTINEL", "Authorization: Bearer SECRET", "completed"),
-        result(PLAN),
+def test_connect_uses_gateway_sidecar_and_fresh_auth_confirmation(method):
+    runner = QueueRunner(result(PLAN))
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        runner,
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
     )
-    auth = facade(runner)
 
     job = wait_done(auth, auth.start_connect(method)["jobId"])
 
-    assert runner.calls[0][0] == [
-        "node.exe", r"C:\npm\openclaw.mjs", "--profile", "easel",
-        "models", "auth", "login", "--provider", "openai", "--method", method,
-    ]
-    command = " ".join(runner.calls[0][0])
-    assert "--force" not in command
-    assert "--set-default" not in command
-    assert "api-key" not in command
+    assert len(sidecar.calls) == 1
+    assert sidecar.calls[0]["method"] == method
+    assert sidecar.calls[0]["timeout"] == 600
+    assert len(sidecar.calls[0]["sessionId"]) >= 16
+    assert runner.calls[0][0][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
     assert job["state"] == "success"
-    assert "ACCESS_SENTINEL" not in json.dumps(job)
-    assert "Authorization" not in json.dumps(job)
+    assert job["phase"] == "complete"
+    assert sidecar.calls[0]["sessionId"] not in json.dumps(job)
 
 
 def test_only_one_active_mutation_job_and_cancel_cleanup():
-    started = threading.Event()
-
-    def block(_argv, cancel_event):
-        started.set()
-        assert cancel_event is not None
-        cancel_event.wait(2)
-        return ProcessResult(-1, "TOKEN_SENTINEL", "", "cancelled")
-
-    auth = facade(QueueRunner(block))
+    sidecar = FakeGatewaySidecar(block=True)
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
     first = auth.start_connect("siwc")
-    assert started.wait(1)
+    assert sidecar.started.wait(1)
     with pytest.raises(ActiveJobError):
         auth.start_connect("oauth")
 
@@ -431,19 +723,445 @@ def test_only_one_active_mutation_job_and_cancel_cleanup():
 
 
 @pytest.mark.parametrize(
-    ("process_result", "state", "error_code"),
+    ("sidecar_result", "state", "error_code"),
     [
-        (ProcessResult(1, "", "TOKEN_SENTINEL", "completed"), "fail", "auth_failed"),
-        (ProcessResult(-1, "", "", "timeout"), "fail", "auth_timeout"),
-        (ProcessResult(-1, "", "", "cancelled"), "cancelled", "auth_cancelled"),
+        (GatewaySidecarResult("failure", "gateway_rpc_failed"), "fail", "gateway_rpc_failed"),
+        (GatewaySidecarResult("failure", "auth_timeout"), "fail", "auth_timeout"),
+        (GatewaySidecarResult("cancelled", "auth_cancelled"), "cancelled", "auth_cancelled"),
     ],
 )
-def test_connect_failure_timeout_cancel_are_bounded(process_result, state, error_code):
-    auth = facade(QueueRunner(process_result))
+def test_connect_failure_timeout_cancel_are_bounded(sidecar_result, state, error_code):
+    sidecar = FakeGatewaySidecar(sidecar_result)
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
     job = wait_done(auth, auth.start_connect("oauth")["jobId"])
     assert job["state"] == state
     assert job["errorCode"] == error_code
-    assert "TOKEN_SENTINEL" not in json.dumps(job)
+    assert "SECRET_SENTINEL" not in json.dumps(job)
+
+
+def test_gateway_unavailable_on_non_windows_requires_manual_terminal_without_sidecar():
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "gateway_unavailable",
+        platform_name="posix",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "interaction_required"
+    assert job["errorCode"] == "gateway_unavailable"
+    assert sidecar.calls == []
+
+
+def test_gateway_ready_never_launches_interactive_fallback():
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert len(sidecar.calls) == 1
+    assert interactive.calls == []
+
+
+def test_windows_offline_default_route_uses_readonly_probe_without_gateway_start(monkeypatch):
+    gateway_starts = []
+    monkeypatch.setattr(
+        "easel.openai_plan_auth.ensure_gateway_ready",
+        lambda **kwargs: gateway_starts.append(kwargs) or "",
+    )
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_ready_probe=lambda: False,
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert gateway_starts == []
+    assert sidecar.calls == []
+    assert len(interactive.calls) == 1
+    assert interactive.calls[0]["argv"][-7:] == [
+        "models", "auth", "login", "--provider", "openai", "--method", "siwc",
+    ]
+
+
+def test_windows_ready_default_route_uses_sidecar_without_interactive_fallback(monkeypatch):
+    gateway_starts = []
+    monkeypatch.setattr(
+        "easel.openai_plan_auth.ensure_gateway_ready",
+        lambda **kwargs: gateway_starts.append(kwargs) or "",
+    )
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_ready_probe=lambda: True,
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert gateway_starts == []
+    assert len(sidecar.calls) == 1
+    assert interactive.calls == []
+
+
+def test_windows_pre_auth_sidecar_failure_falls_back_after_sidecar_settles():
+    sequence = []
+
+    class SettledSidecar(FakeGatewaySidecar):
+        def run(self, **kwargs):
+            sequence.append("sidecar_started")
+            completed = super().run(**kwargs)
+            sequence.append("sidecar_settled")
+            return completed
+
+    class SequencedInteractive(FakeInteractiveRunner):
+        def run(self, argv, **kwargs):
+            sequence.append("interactive_started")
+            return super().run(argv, **kwargs)
+
+    sidecar = SettledSidecar(
+        GatewaySidecarResult("failure", "gateway_client_unavailable", fallback_eligible=True)
+    )
+    interactive = SequencedInteractive()
+    auth = facade(
+        QueueRunner(result(PLAN)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "success"
+    assert sequence == ["sidecar_started", "sidecar_settled", "interactive_started"]
+
+
+@pytest.mark.parametrize(
+    "sidecar_result",
+    [
+        GatewaySidecarResult("failure", "gateway_rpc_failed", fallback_eligible=False),
+        GatewaySidecarResult("failure", "auth_timeout", fallback_eligible=True),
+        GatewaySidecarResult("cancelled", "auth_cancelled", fallback_eligible=True),
+    ],
+)
+def test_windows_sidecar_post_admission_timeout_or_cancel_never_falls_back(sidecar_result):
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: FakeGatewaySidecar(sidecar_result),
+        gateway_readiness=lambda: "",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] in {"fail", "cancelled"}
+    assert interactive.calls == []
+
+
+@pytest.mark.parametrize("method", ["siwc", "oauth"])
+def test_gateway_unavailable_on_windows_launches_exact_interactive_argv_and_confirms_fresh_profile(method):
+    sidecar = FakeGatewaySidecar()
+    interactive = FakeInteractiveRunner()
+    runner = QueueRunner(result(PLAN))
+    auth = facade(
+        runner,
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect(method)["jobId"])
+
+    assert job["state"] == "success"
+    assert sidecar.calls == []
+    assert interactive.calls[0]["argv"] == [
+        "node.exe",
+        r"C:\npm\openclaw.mjs",
+        "--profile",
+        "easel",
+        "models",
+        "auth",
+        "login",
+        "--provider",
+        "openai",
+        "--method",
+        method,
+    ]
+    assert interactive.calls[0]["timeout"] == 600
+    assert runner.calls[0][0][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
+    assert "token" not in " ".join(interactive.calls[0]["argv"]).lower()
+    assert "url" not in " ".join(interactive.calls[0]["argv"]).lower()
+
+
+def test_interactive_runner_uses_visible_console_without_shell_or_stdio_capture(monkeypatch):
+    seen = {}
+
+    class Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return Proc()
+
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+
+    got = InteractiveAuthProcessRunner(cwd=None).run(
+        ["node.exe", "openclaw.mjs", "--profile", "easel"],
+        timeout=1,
+        cancel_event=threading.Event(),
+        on_process=None,
+    )
+
+    assert got == ProcessResult(0, "", "", "completed")
+    assert seen["kwargs"]["shell"] is False
+    assert seen["kwargs"]["creationflags"] == 0x210
+    assert "stdout" not in seen["kwargs"]
+    assert "stderr" not in seen["kwargs"]
+    assert "stdin" not in seen["kwargs"]
+
+
+@pytest.mark.parametrize(("cancelled", "expected"), [(True, "cancelled"), (False, "timeout")])
+def test_interactive_runner_stops_only_its_tracked_child(monkeypatch, cancelled, expected):
+    cancel_event = threading.Event()
+
+    class Proc:
+        returncode = None
+        terminate_calls = 0
+        kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("openclaw", timeout)
+            return self.returncode
+
+        def terminate(self):
+            self.terminate_calls += 1
+            self.returncode = 1
+
+        def kill(self):
+            self.kill_calls += 1
+            self.returncode = 1
+
+    tracked = Proc()
+    unrelated = Proc()
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.Popen", lambda *_args, **_kwargs: tracked)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr("easel.openai_plan_auth.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+
+    def remember(_proc):
+        if cancelled:
+            cancel_event.set()
+
+    got = InteractiveAuthProcessRunner(cwd=None).run(
+        ["node.exe", "openclaw.mjs"],
+        timeout=0.01,
+        cancel_event=cancel_event,
+        on_process=remember,
+    )
+
+    assert got.outcome == expected
+    assert tracked.terminate_calls == 1
+    assert tracked.kill_calls == 0
+    assert unrelated.terminate_calls == 0
+    assert unrelated.kill_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("completed", "state", "error_code"),
+    [
+        (ProcessResult(7, "TERMINAL_SECRET", "TERMINAL_SECRET", "completed"), "fail", "auth_failed"),
+        (ProcessResult(-1, "TERMINAL_SECRET", "TERMINAL_SECRET", "timeout"), "fail", "auth_timeout"),
+        (ProcessResult(-1, "TERMINAL_SECRET", "TERMINAL_SECRET", "cancelled"), "cancelled", "auth_cancelled"),
+    ],
+)
+def test_interactive_failure_states_do_not_expose_terminal_output(completed, state, error_code):
+    interactive = FakeInteractiveRunner(completed)
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == state
+    assert job["errorCode"] == error_code
+    assert "TERMINAL_SECRET" not in json.dumps(job)
+
+
+def test_interactive_exit_zero_without_fresh_plan_profile_fails_closed():
+    auth = facade(
+        QueueRunner(result(API_KEY)),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=FakeInteractiveRunner(),
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_not_confirmed"
+
+
+def test_existing_profile_cannot_complete_windows_fallback_before_child_exit():
+    interactive = FakeInteractiveRunner(block=True)
+    runner = QueueRunner(result(PLAN))
+    auth = facade(
+        runner,
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    started = auth.start_connect("siwc")
+    assert interactive.started.wait(1)
+    running = auth.get_job(started["jobId"])
+    assert running["state"] == "running"
+    assert running["phase"] == "terminal_opened"
+    assert running["message"] == "OpenClaw interactive sign-in window opened"
+    assert runner.calls == []
+    interactive.release.set()
+
+    assert wait_done(auth, started["jobId"])["state"] == "success"
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("method", ["siwc", "oauth"])
+def test_non_windows_gateway_unavailable_never_auto_launches_terminal(method):
+    interactive = FakeInteractiveRunner()
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="posix",
+    )
+
+    job = wait_done(auth, auth.start_connect(method)["jobId"])
+
+    assert job["state"] == "interaction_required"
+    assert job["errorCode"] == "gateway_unavailable"
+    assert job["terminalCommand"] == f"openclaw --profile easel models auth login --provider openai --method {method}"
+    assert interactive.calls == []
+
+
+def test_cancelled_windows_fallback_stops_only_the_tracked_child():
+    interactive = FakeInteractiveRunner(block=True)
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=interactive,
+        platform_name="nt",
+    )
+
+    started = auth.start_connect("siwc")
+    assert interactive.started.wait(1)
+    auth.cancel_job(started["jobId"])
+    job = wait_done(auth, started["jobId"])
+
+    assert job["state"] == "cancelled"
+    assert job["errorCode"] == "auth_cancelled"
+    assert len(interactive.calls) == 1
+
+
+def test_interactive_child_launch_failure_is_bounded():
+    class BrokenRunner:
+        def run(self, *_args, **_kwargs):
+            raise OSError("TERMINAL_SECRET")
+
+    auth = facade(
+        QueueRunner(),
+        gateway_readiness=lambda: "gateway_unavailable",
+        interactive_runner=BrokenRunner(),
+        platform_name="nt",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_process_error"
+    assert "TERMINAL_SECRET" not in json.dumps(job)
+
+
+def test_cancel_during_gateway_readiness_never_starts_login_sidecar():
+    entered = threading.Event()
+    release = threading.Event()
+    sidecar = FakeGatewaySidecar()
+
+    def readiness():
+        entered.set()
+        release.wait(2)
+        return ""
+
+    auth = facade(
+        QueueRunner(),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=readiness,
+    )
+    started = auth.start_connect("siwc")
+    assert entered.wait(1)
+
+    auth.cancel_job(started["jobId"])
+    release.set()
+    job = wait_done(auth, started["jobId"])
+
+    assert job["state"] == "cancelled"
+    assert job["errorCode"] == "auth_cancelled"
+    assert sidecar.calls == []
+
+
+def test_terminal_success_without_fresh_plan_profile_fails_closed():
+    sidecar = FakeGatewaySidecar()
+    auth = facade(
+        QueueRunner(result(API_KEY)),
+        gateway_sidecar_factory=lambda: sidecar,
+        gateway_readiness=lambda: "",
+    )
+
+    job = wait_done(auth, auth.start_connect("siwc")["jobId"])
+
+    assert job["state"] == "fail"
+    assert job["errorCode"] == "auth_not_confirmed"
 
 
 def test_device_code_is_safe_terminal_only_fallback_without_spawning():
@@ -785,6 +1503,20 @@ def test_public_handle_is_bound_to_current_profile_snapshot():
     with pytest.raises(InvalidRequestError):
         auth.test_and_use(handle, "openai/gpt-6-astra")
     assert not any("activate" in call[0] for call in runner.calls)
+
+
+def test_test_use_readonly_checks_do_not_use_cold_start_retry_budget():
+    runner = QueueRunner(
+        result(PLAN),
+        result(STATUS),
+        ProcessResult(-1, "ACCESS_SENTINEL", "SECRET", "timeout"),
+    )
+    auth, handle = mapped_facade(runner)
+
+    with pytest.raises(InvalidRequestError, match="profile_handle_not_current"):
+        auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert [call[1] for call in runner.calls] == [30, 30, 30]
 
 
 def test_no_api_key_mutation_or_auth_order_commands_exist_in_facade_source():

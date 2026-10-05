@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom';
 import type { Dispatch, SetStateAction } from 'react';
 import EnvBoard from './EnvBoard';
 import type { JobView } from './EnvBoard';
+import ChatGPTPlanCard from './ChatGPTPlanCard';
+import type { ChatGPTPlanSummary } from './ChatGPTPlanCard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
   fetchModelChannels, runChannelSelftest, saveModelConfig,
@@ -56,6 +58,7 @@ const hhmm = (ts: number) => {
 export default function SettingsPanel({ onClose }: Props) {
   const [sec, setSec] = useState<Sec>('model');
   const [chan, setChan] = useState<Chan>('chat');
+  const [planSummary, setPlanSummary] = useState<ChatGPTPlanSummary | null>(null);
 
   // ── 环境安装（引擎真实数据） ──────────────────────────────
   const [tools, setTools] = useState<EnvTool[]>([]);
@@ -627,11 +630,19 @@ export default function SettingsPanel({ onClose }: Props) {
                 {chan === 'chat' && (
                   <section className="st-panel active">
                     <div className="panel-top">
-                      <span className={`pill ${chatOk ? 'ok' : 'off'}`}><span className="dot" />{chatOk ? '主通道在线' : '未配置'}</span>
-                      <span className="desc">经本地网关路由（主备自动降级）</span>
+                      <span className={`pill ${planSummary?.usable || chatOk ? 'ok' : 'off'}`}>
+                        <span className="dot" />
+                        {planSummary?.usable ? 'ChatGPT Plan 在线' : chatOk ? '主通道在线' : '未配置'}
+                      </span>
+                      <span className="desc">ChatGPT Plan 与 API Key 通道分开管理</span>
                       {selftest && <span className="desc">上次自测 {hhmm(selftest.testedAt)}</span>}
                       <span className="spacer" />
                       <button className="btn btn-sm" onClick={() => void doSelftest('chat')} disabled={testing}>自测本通道</button>
+                    </div>
+                    <ChatGPTPlanCard onSummaryChange={setPlanSummary} />
+                    <div className="plan-provider-heading">
+                      <strong>API / compatible provider</strong>
+                      <span>使用 API Key 的独立配置</span>
                     </div>
                     {renderBoard(chatRows, { onRow: (i, p) => updateRow(setChatRows, i, p), onPrimary: setPrimaryRow, onRemove: removeRow })}
                     <div className="add-row" onClick={addProvider}>＋ 添加供应商（填名称 / 模型 / Base URL / Key；点「设为主」切换生效通道）</div>
@@ -688,7 +699,7 @@ export default function SettingsPanel({ onClose }: Props) {
                         </div>
                       );
                     })()}
-                    <div className="foot-note">改完点右上角「保存配置」（key 留空=不改）；自动降级链随统一网关接入开放。</div>
+                    <div className="foot-note">API/provider 改完点右上角「保存配置」（key 留空=不改）；ChatGPT Plan 登录与此处配置分开管理。</div>
                   </section>
                 )}
 
@@ -790,7 +801,7 @@ export default function SettingsPanel({ onClose }: Props) {
         </div>
 
         <div className="settings-foot">
-          ⓘ 环境安装在后台执行，装完自动回写状态；模型配置保存写入 .env（对话经本地网关路由，主备自动降级）。
+          ⓘ 环境安装在后台执行，装完自动回写状态；API/provider 配置保存写入 .env，ChatGPT Plan 由 OpenClaw 独立管理。
         </div>
       </div>
     </div>
