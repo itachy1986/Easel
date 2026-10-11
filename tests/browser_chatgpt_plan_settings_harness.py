@@ -42,6 +42,12 @@ def plan_status(**overrides: Any) -> dict[str, Any]:
         "displayLabel": "",
         "selectedModel": "",
         "runtimeStatus": "missing",
+        "planConnected": False,
+        "planReauthRequired": False,
+        "planRuntimeStatus": "missing",
+        "platformCredentialPresent": False,
+        "platformFallbackEnabled": False,
+        "effectiveTextBillingRoute": "unknown",
         "errorCode": "",
         "recoveryAction": "",
         "deviceCodeWebSupported": False,
@@ -62,6 +68,9 @@ def usable_status(**overrides: Any) -> dict[str, Any]:
         displayLabel="ChatGPT Plan account",
         selectedModel="openai/gpt-6-sol",
         runtimeStatus="usable",
+        planConnected=True,
+        planRuntimeStatus="usable",
+        effectiveTextBillingRoute="chatgpt_plan",
         profiles=[{
             "handle": handle,
             "displayLabel": "ChatGPT Plan account",
@@ -185,6 +194,11 @@ class MockPlanApi:
             route.fulfill(json=deepcopy(self.models))
         elif path == "/api/settings/openai-plan/test-use":
             route.fulfill(json=deepcopy(self.test_use))
+        elif path == "/api/settings/openai-plan/platform-fallback":
+            enabled = bool(isinstance(payload, dict) and payload.get("enabled") is True)
+            current = self.statuses[-1]
+            current["platformFallbackEnabled"] = enabled
+            route.fulfill(json={"ok": True, "platformFallbackEnabled": enabled})
         elif path == "/api/status":
             route.fulfill(json={"gateway": False, "skills": [], "personas": []})
         elif path == "/api/personas":
@@ -264,7 +278,9 @@ def run_matrix() -> None:
         # Platform credentials may block activation, but must not block auth.
         platform_only = plan_status(
             billingSource="platform_api",
-            errorCode="billing_ambiguity",
+            platformCredentialPresent=True,
+            effectiveTextBillingRoute="blocked",
+            errorCode="platform_fallback_disabled",
             recoveryAction="review_openai_billing_sources",
         )
 
@@ -272,6 +288,7 @@ def run_matrix() -> None:
             expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("Platform API")
             expect(page.get_by_test_id("plan-risk")).to_contain_text("你仍可登录 ChatGPT Plan")
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_be_enabled()
+            expect(page.get_by_role("checkbox", name="允许 Platform API 文本 fallback")).to_be_disabled()
             expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
             assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
 
@@ -408,12 +425,11 @@ def run_matrix() -> None:
 
         with_scenario(browser, success_api, auth_success)
 
-        # A successful login can still return mixed billing proof.  It must
-        # show the signed-in-but-not-activated state without fetching models.
+        # A successful login with a dormant Platform credential remains
+        # Plan-only when fallback is explicitly OFF.
         mixed_after_login = usable_status(
-            usable=False,
-            billingSource="mixed",
-            errorCode="platform_fallback_present",
+            platformCredentialPresent=True,
+            platformFallbackEnabled=False,
         )
         mixed_success_api = MockPlanApi(
             statuses=[platform_only, mixed_after_login],
@@ -429,10 +445,10 @@ def run_matrix() -> None:
 
         def auth_success_mixed(page: Page, api: MockPlanApi) -> None:
             page.get_by_role("button", name="Continue with ChatGPT (Beta)").click()
-            expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
-            expect(page.get_by_test_id("plan-risk")).to_be_visible()
-            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
-            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+            expect(page.get_by_test_id("plan-model-select")).to_be_visible(timeout=5_000)
+            expect(page.get_by_test_id("plan-risk")).to_contain_text("fallback 当前关闭")
+            expect(page.get_by_role("button", name="Test & use")).to_be_enabled()
+            assert "/api/settings/openai-plan/models" in [path for _, path, _ in api.calls]
 
         with_scenario(browser, mixed_success_api, auth_success_mixed)
 
@@ -481,36 +497,48 @@ def run_matrix() -> None:
 
         with_scenario(browser, MockPlanApi(statuses=[usable_status()]), usable)
 
-        # 7. Mixed/platform fallback is explicit and fail closed.
+        # 7. A stored Platform credential is dormant by default.
         mixed = usable_status(
-            usable=False,
-            reauthRequired=False,
-            billingSource="mixed",
-            runtimeStatus="unavailable",
-            errorCode="platform_fallback_present",
+            platformCredentialPresent=True,
+            platformFallbackEnabled=False,
         )
 
         def mixed_check(page: Page, api: MockPlanApi) -> None:
-            expect(page.get_by_test_id("plan-risk")).to_contain_text("意外 API 计费")
-            expect(page.get_by_test_id("plan-status-copy")).to_contain_text("已登录 · 尚未安全启用")
-            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("已登录 · 需检查")
+            expect(page.get_by_test_id("plan-risk")).to_contain_text("fallback 当前关闭")
+            expect(page.locator(".chatgpt-plan-head .pill")).to_have_text("Connected")
             expect(page.get_by_role("button", name="重新登录 ChatGPT")).to_have_count(0)
             expect(page.get_by_role("button", name="Continue with ChatGPT (Beta)")).to_have_count(0)
-            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+            expect(page.get_by_role("button", name="Test & use")).to_be_enabled()
+            expect(page.get_by_role("checkbox", name="允许 Platform API 文本 fallback")).not_to_be_checked()
             page.get_by_text("兼容登录方式", exact=True).click()
             expect(page.get_by_role("button", name="使用 OAuth 登录")).to_be_disabled()
-            assert "/api/settings/openai-plan/models" not in [path for _, path, _ in api.calls]
+            assert "/api/settings/openai-plan/models" in [path for _, path, _ in api.calls]
 
         with_scenario(browser, MockPlanApi(statuses=[mixed]), mixed_check)
 
-        # A mixed profile with explicit credential reauth evidence may still
-        # reauthenticate, but cannot activate until exclusive billing is proven.
+        # Explicitly enabling fallback displays the charge warning and closes
+        # Test & use until the policy returns to Plan-only.
+        fallback_on = usable_status(
+            platformCredentialPresent=True,
+            platformFallbackEnabled=True,
+        )
+
+        def fallback_on_check(page: Page, _api: MockPlanApi) -> None:
+            expect(page.get_by_test_id("plan-risk")).to_contain_text("可能产生 OpenAI Platform API 费用")
+            expect(page.get_by_role("checkbox", name="允许 Platform API 文本 fallback")).to_be_checked()
+            expect(page.get_by_role("button", name="Test & use")).to_have_count(0)
+
+        with_scenario(browser, MockPlanApi(statuses=[fallback_on]), fallback_on_check)
+
+        # Explicit credential reauth evidence may still reauthenticate.
         mixed_reauth = usable_status(
             usable=False,
             reauthRequired=True,
-            billingSource="mixed",
+            planReauthRequired=True,
             runtimeStatus="missing",
-            errorCode="platform_fallback_present",
+            planRuntimeStatus="missing",
+            platformCredentialPresent=True,
+            errorCode="profile_unusable",
         )
 
         def mixed_reauth_check(page: Page, api: MockPlanApi) -> None:

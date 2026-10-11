@@ -82,9 +82,11 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
+OPENAI_PLATFORM_FALLBACK_ENV = "EASEL_OPENAI_PLATFORM_FALLBACK"
 OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
     profile=OPENCLAW_PROFILE,
     cwd=PROJECT_ROOT,
+    platform_fallback_enabled=lambda: _platform_fallback_enabled(),
 )
 # 对话传输层：http＝直连常驻 gateway 的 OpenAI 兼容端点，agent 在 gateway 进程里直接跑，
 # 省掉每轮 spawn `openclaw agent` 瘦客户端的冷启动（本机实测同一句话：CLI 7.1-7.6s/轮，
@@ -696,6 +698,13 @@ def _read_env() -> dict[str, str]:
     return result
 
 
+def _platform_fallback_enabled() -> bool:
+    """Non-secret, explicit opt-in. Missing/invalid values always mean OFF."""
+    return _read_env().get(OPENAI_PLATFORM_FALLBACK_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _is_set(val: str | None) -> bool:
     """非空且非占位符才算真正配置了。"""
     if not val or not val.strip():
@@ -863,6 +872,9 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
 
 
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
+    preflight = _prepare_openai_text_inference()
+    if not preflight["ok"]:
+        return _text_policy_error(preflight["errorCode"])
     sk = session_id or f'web-{int(time.time() * 1000)}'
     _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效
     # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
@@ -883,6 +895,34 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
         return f'❌ {e}'
     finally:
         xlock.release()
+
+
+def _uses_canonical_openai_text() -> bool:
+    try:
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+        primary = (((data.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary")
+        return isinstance(primary, str) and primary.startswith("openai/")
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _prepare_openai_text_inference() -> dict[str, object]:
+    if not _uses_canonical_openai_text():
+        return {"ok": True, "billingRoute": "other", "errorCode": ""}
+    return OPENAI_PLAN_AUTH.prepare_text_inference()
+
+
+def _text_policy_error(error_code: str) -> str:
+    safe = {
+        "plan_auth_missing": "❌ ChatGPT Plan 尚未连接，未发送请求。",
+        "plan_reauth_required": "❌ ChatGPT Plan 需要重新登录，未发送请求。",
+        "plan_runtime_unavailable": "❌ ChatGPT Plan 本机运行时暂不可用，未切换到 Platform API。",
+        "local_runtime_unavailable": "❌ 无法确认 OpenClaw 本机运行状态，未发送请求。",
+        "billing_ambiguity": "❌ 无法确认本轮计费来源，已安全阻止。",
+        "platform_fallback_disabled": "❌ ChatGPT Plan 不可用且 Platform fallback 已关闭，未产生 API 计费。",
+        "runtime_policy_unavailable": "❌ 无法应用 OpenClaw 文本认证策略，已安全阻止。",
+    }
+    return safe.get(error_code, "❌ 无法安全确认本轮认证与计费来源，已阻止请求。")
 
 
 def check_gateway() -> bool:
@@ -1614,6 +1654,10 @@ class OpenAIPlanTestUseRequest(BaseModel):
     model: str
 
 
+class OpenAIPlanFallbackRequest(BaseModel):
+    enabled: bool
+
+
 @app.get("/api/settings/openai-plan/status")
 async def api_openai_plan_status():
     """Return the allowlisted OpenClaw-managed OpenAI plan status."""
@@ -1664,6 +1708,40 @@ async def api_openai_plan_test_use(req: OpenAIPlanTestUseRequest):
         )
     except OpenAIPlanInvalidRequest:
         raise HTTPException(400, "Profile 或模型已失效，请刷新后重试") from None
+
+
+@app.post("/api/settings/openai-plan/platform-fallback")
+async def api_openai_plan_platform_fallback(req: OpenAIPlanFallbackRequest):
+    """Explicitly apply the OpenClaw text auth order, then persist the opt-in."""
+    previous = _platform_fallback_enabled()
+    try:
+        result = await asyncio.to_thread(
+            OPENAI_PLAN_AUTH.set_platform_fallback,
+            req.enabled,
+        )
+    except OpenAIPlanInvalidRequest as exc:
+        safe_code = str(exc)
+        safe_detail = {
+            "plan_auth_required": "请先连接 ChatGPT Plan。",
+            "platform_credential_required": "未检测到可用于 fallback 的 Platform credential。",
+            "auth_status_unavailable": "暂时无法读取 OpenClaw 登录状态。",
+            "runtime_policy_unavailable": "OpenClaw 暂时无法应用文本路由策略。",
+        }.get(safe_code, "无法更新 Platform fallback 设置。")
+        raise HTTPException(409, safe_detail) from None
+    try:
+        _write_env_direct({OPENAI_PLATFORM_FALLBACK_ENV: "1" if req.enabled else "0"})
+    except OSError:
+        # Keep the persisted preference and the official auth order aligned.
+        # The rollback uses the same bounded, secret-free façade operation.
+        try:
+            await asyncio.to_thread(
+                OPENAI_PLAN_AUTH.set_platform_fallback,
+                previous,
+            )
+        except OpenAIPlanInvalidRequest:
+            pass
+        raise HTTPException(500, "无法持久化 Platform fallback；已尝试恢复原策略。") from None
+    return result
 
 
 @app.post("/api/settings/models/save")
@@ -2517,6 +2595,21 @@ async def api_chat_stream(req: ChatRequest):
 
         # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
         to_client("activity", "⏳ 已收到，正在唤醒 agent…")
+
+        preflight = await asyncio.to_thread(_prepare_openai_text_inference)
+        if not preflight.get("ok"):
+            safe_error = _text_policy_error(str(preflight.get("errorCode") or ""))
+            _save_turn(pk, "done", safe_error, {
+                "turn_id": turn_id,
+                "clean_end": False,
+                "stop_reason": "auth_policy_blocked",
+            })
+            to_client("error", safe_error)
+            to_client("done", sessionKey=sk)
+            client_q.put_nowait(CLIENT_DONE)
+            return
+        if preflight.get("billingRoute") == "platform_fallback":
+            to_client("activity", "⚠️ 已明确启用 Platform fallback，本轮可能产生 OpenAI API 费用。")
 
         async def _run_gateway_turn(hproc):
             """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。

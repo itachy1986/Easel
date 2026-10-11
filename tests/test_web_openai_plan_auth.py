@@ -39,6 +39,14 @@ class FakeFacade:
         self.calls.append(("test", profile_handle, model))
         return {"ok": True, "selectedModel": model, "effectiveProvider": "openai", "testResult": "success", "errorCode": ""}
 
+    def set_platform_fallback(self, enabled):
+        self.calls.append(("fallback", enabled))
+        return {"ok": True, "platformFallbackEnabled": enabled}
+
+    def prepare_text_inference(self):
+        self.calls.append(("text-preflight",))
+        return {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
+
     def shutdown(self):
         self.calls.append(("shutdown",))
 
@@ -59,7 +67,105 @@ def test_openai_plan_routes_are_thin_and_safe(monkeypatch):
         )
         assert response.status_code == 200
         assert response.json()["selectedModel"] == "openai/gpt-6-astra"
+        fallback = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+        assert fallback.status_code == 200
+        assert fallback.json()["platformFallbackEnabled"] is True
+    assert ("fallback", True) in fake.calls
     assert ("shutdown",) in fake.calls
+
+
+def test_platform_fallback_setting_persists_only_after_official_policy_succeeds(tmp_path, monkeypatch):
+    fake = FakeFacade()
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=value\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 200
+    assert ("fallback", True) in fake.calls
+    assert "EASEL_OPENAI_PLATFORM_FALLBACK=1" in env_file.read_text(encoding="utf-8")
+    assert "KEEP=value" in env_file.read_text(encoding="utf-8")
+
+
+def test_platform_fallback_setting_is_not_persisted_when_policy_apply_fails(tmp_path, monkeypatch):
+    from easel.openai_plan_auth import InvalidRequestError
+
+    class Reject(FakeFacade):
+        def set_platform_fallback(self, enabled):
+            raise InvalidRequestError("runtime_policy_unavailable")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=value\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", Reject())
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 409
+    assert env_file.read_text(encoding="utf-8") == "KEEP=value\n"
+
+
+def test_platform_fallback_setting_rolls_back_policy_when_env_write_fails(tmp_path, monkeypatch):
+    fake = FakeFacade()
+    env_file = tmp_path / ".env"
+    env_file.write_text("EASEL_OPENAI_PLATFORM_FALLBACK=0\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    monkeypatch.setattr(web, "_write_env_direct", lambda _updates: (_ for _ in ()).throw(OSError()))
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 500
+    assert fake.calls[:2] == [("fallback", True), ("fallback", False)]
+    assert env_file.read_text(encoding="utf-8") == "EASEL_OPENAI_PLATFORM_FALLBACK=0\n"
+
+
+def test_text_policy_only_wraps_canonical_openai_chat_and_leaves_media_custom_routes_unchanged(
+    tmp_path, monkeypatch
+):
+    fake = FakeFacade()
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": {"primary": "openai/gpt-6-astra"}}}}),
+        encoding="utf-8",
+    )
+    assert web._prepare_openai_text_inference()["billingRoute"] == "chatgpt_plan"
+    assert ("text-preflight",) in fake.calls
+
+    fake.calls.clear()
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": {"primary": "anthropic/claude"}}}}),
+        encoding="utf-8",
+    )
+    assert web._prepare_openai_text_inference() == {
+        "ok": True,
+        "billingRoute": "other",
+        "errorCode": "",
+    }
+    assert fake.calls == []
 
 
 def test_test_use_rejects_unknown_handle_as_400_without_echo(monkeypatch):
@@ -130,3 +236,21 @@ def test_frontend_maps_gateway_job_phases_and_safe_failure_codes():
     assert "正在等待 OpenClaw 完成登录" in card
     assert "openclaw --profile easel models auth login --provider openai --method siwc" in hook
     assert "terminalCommand" in hook
+
+
+def test_frontend_exposes_explicit_platform_fallback_without_weakening_plan_test_gate():
+    hook = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "useChatGPTPlan.ts").read_text(
+        encoding="utf-8"
+    )
+    card = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "ChatGPTPlanCard.tsx").read_text(
+        encoding="utf-8"
+    )
+    api = (PROJECT_ROOT / "web" / "frontend" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+
+    assert "platformFallbackEnabled" in api
+    assert "platformCredentialPresent" in api
+    assert "effectiveTextBillingRoute" in api
+    assert "/api/settings/openai-plan/platform-fallback" in api
+    assert "!status.platformFallbackEnabled" in hook
+    assert "允许 Platform API 文本 fallback" in card
+    assert "可能产生 OpenAI Platform API 费用" in card

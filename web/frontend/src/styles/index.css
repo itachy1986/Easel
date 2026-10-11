@@ -1331,6 +1331,10 @@ textarea.field { resize: vertical; min-height: 90px; }
 .settings-overlay .plan-notice.ok { background: var(--green-soft); color: var(--green); }
 .settings-overlay .plan-notice.warn, .settings-overlay .plan-notice.risk { background: var(--amber-soft); color: var(--text); }
 .settings-overlay .plan-notice.error { background: var(--red-soft); color: var(--red); }
+.settings-overlay .plan-fallback-control { width: 100%; display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.settings-overlay .plan-fallback-control input { margin-top: 2px; accent-color: var(--accent-end); }
+.settings-overlay .plan-fallback-control span { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.settings-overlay .plan-fallback-control small { color: var(--text-tertiary); line-height: 1.45; }
 .settings-overlay .plan-connect { display: flex; width: 100%; align-items: center; gap: 9px; color: var(--text-secondary); font-size: 12.5px; }
 .settings-overlay .plan-connect .btn { margin-left: auto; }
 .settings-overlay .plan-model-row { display: grid; width: 100%; grid-template-columns: auto minmax(220px, 1fr) auto; align-items: center; gap: 10px; }

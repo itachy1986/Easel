@@ -208,7 +208,47 @@ def _openclaw_config_path() -> Path:
     return config_path()
 
 
-def _primary_model_routable() -> tuple[bool, str]:
+def _openai_plan_status() -> dict:
+    """Read only the sanitized OpenClaw auth/status façade; never credential bytes."""
+    try:
+        from easel.openai_plan_auth import OpenAIPlanAuthFacade
+        return OpenAIPlanAuthFacade(
+            platform_fallback_enabled=_platform_fallback_enabled,
+        ).status()
+    except Exception:  # noqa: BLE001 - doctor must classify runtime failure safely
+        return {
+            "available": False,
+            "planConnected": False,
+            "planReauthRequired": False,
+            "planRuntimeStatus": "unknown",
+            "platformCredentialPresent": False,
+        }
+
+
+def _platform_fallback_enabled() -> bool:
+    env_file = PROJECT_ROOT / ".env"
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("EASEL_OPENAI_PLATFORM_FALLBACK="):
+                value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                return value.lower() in {"1", "true", "yes", "on"}
+    except OSError:
+        pass
+    return False
+
+
+def _plan_auth_available(status: dict | None) -> bool:
+    return bool(
+        isinstance(status, dict)
+        and status.get("available") is True
+        and status.get("planConnected") is True
+        and status.get("planReauthRequired") is not True
+        and status.get("planRuntimeStatus") == "usable"
+    )
+
+
+def _primary_model_routable(plan_status: dict | None = None) -> tuple[bool, str]:
     """检查 agents.defaults.model.primary 指向的 provider 在 openclaw 里真的配了认证。
 
     上面的 `.env (API Key)` 只查 .env 静态有没有填值，查不出 setup 有没有真把 provider
@@ -236,6 +276,18 @@ def _primary_model_routable() -> tuple[bool, str]:
         return True, ""
 
     provider = primary.split("/", 1)[0]
+    if provider == "openai":
+        status = plan_status if plan_status is not None else _openai_plan_status()
+        if _plan_auth_available(status):
+            return True, "ChatGPT Plan / OAuth 可用（由 OpenClaw 管理）"
+        if isinstance(status, dict) and status.get("planConnected") is True:
+            if status.get("planReauthRequired") is True:
+                return False, "ChatGPT Plan credential 需要重新登录"
+            return False, "ChatGPT Plan 已登录，但 OpenClaw 运行时暂不可用"
+        if isinstance(status, dict) and status.get("platformCredentialPresent") is True:
+            if status.get("platformFallbackEnabled") is True:
+                return True, "OpenAI Platform API credential 可用；文本 fallback 已明确启用"
+            return False, "OpenAI Platform API credential 可用，但文本 fallback 当前关闭"
     providers = (cfg.get("models") or {}).get("providers") or {}
     entry = providers.get(provider)
     if not isinstance(entry, dict):
@@ -296,10 +348,17 @@ def cmd_doctor(_args) -> int:
     all_ok &= _check("Playwright Chromium", _chromium_available(),
                       "运行 python3 -m playwright install chromium")
 
-    # 3. .env file with valid key
+    # 3. API-key and OpenClaw-managed OAuth are independent valid auth paths.
     env_ok = _env_key_valid()
-    all_ok &= _check(".env (API Key)", env_ok,
-                      "填 ANTHROPIC_API_KEY，或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL")
+    plan_status = _openai_plan_status()
+    plan_ok = _plan_auth_available(plan_status)
+    platform_ok = bool(plan_status.get("platformCredentialPresent"))
+    auth_detail = "ChatGPT Plan / OAuth 可用（由 OpenClaw 管理）" if plan_ok else (
+        "OpenAI Platform API credential 可用" if platform_ok else
+        "OpenClaw 登录状态暂不可用" if plan_status.get("available") is not True else
+        "填 ANTHROPIC_API_KEY，或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL，或连接 ChatGPT Plan"
+    )
+    all_ok &= _check("模型认证 (API Key / ChatGPT Plan)", env_ok or plan_ok or platform_ok, auth_detail)
 
     # 3.5 本机 agent CLI：有免 key 通道时提示用户（.env 没配也可能是绿灯路径）。
     # 不计入 all_ok —— 装不装 Claude Code 是用户的选择，不是环境故障。
@@ -316,7 +375,7 @@ def cmd_doctor(_args) -> int:
         pass
 
     # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
-    route_ok, route_detail = _primary_model_routable()
+    route_ok, route_detail = _primary_model_routable(plan_status)
     all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
 
     # 4. OpenClaw gateway running
