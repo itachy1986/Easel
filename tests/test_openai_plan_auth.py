@@ -460,6 +460,16 @@ def test_platform_fallback_toggle_uses_official_per_agent_auth_order(enabled, ex
     assert command[policy_start + 8:] == expected_order
 
 
+def test_platform_fallback_cannot_be_enabled_from_platform_credential_alone():
+    runner = QueueRunner(result(API_KEY))
+
+    with pytest.raises(InvalidRequestError, match="plan_auth_required"):
+        facade(runner).set_platform_fallback(True)
+
+    assert len(runner.calls) == 1
+    assert not any("order" in call[0] for call in runner.calls)
+
+
 def test_text_preflight_fails_closed_when_only_platform_exists_and_fallback_is_off():
     runner = QueueRunner(result(API_KEY), result(status_for_api_key()))
 
