@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -43,9 +44,15 @@ class FakeFacade:
         self.calls.append(("fallback", enabled))
         return {"ok": True, "platformFallbackEnabled": enabled}
 
-    def prepare_text_inference(self):
-        self.calls.append(("text-preflight",))
-        return {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
+    def prepare_text_inference(self, model=None):
+        self.calls.append(("text-preflight", model))
+        return {
+            "ok": True,
+            "billingRoute": "chatgpt_plan",
+            "errorCode": "",
+            "runtimeModel": f"{model}@openai:work" if model else "",
+            "authProfilePinned": True,
+        }
 
     def shutdown(self):
         self.calls.append(("shutdown",))
@@ -140,7 +147,7 @@ def test_platform_fallback_setting_rolls_back_policy_when_env_write_fails(tmp_pa
     assert env_file.read_text(encoding="utf-8") == "EASEL_OPENAI_PLATFORM_FALLBACK=0\n"
 
 
-def test_text_policy_only_wraps_canonical_openai_chat_and_leaves_media_custom_routes_unchanged(
+def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unchanged(
     tmp_path, monkeypatch
 ):
     fake = FakeFacade()
@@ -149,23 +156,105 @@ def test_text_policy_only_wraps_canonical_openai_chat_and_leaves_media_custom_ro
     monkeypatch.setattr(web, "_oc_config_path", lambda: config)
 
     config.write_text(
-        json.dumps({"agents": {"defaults": {"model": {"primary": "openai/gpt-6-astra"}}}}),
+        json.dumps({
+            "agents": {
+                "defaults": {"model": {"primary": "anthropic/claude"}},
+                "list": [{"id": "main", "model": {"primary": "openai/gpt-6-astra"}}],
+            }
+        }),
         encoding="utf-8",
     )
     assert web._prepare_openai_text_inference()["billingRoute"] == "chatgpt_plan"
-    assert ("text-preflight",) in fake.calls
+    assert ("text-preflight", "openai/gpt-6-astra") in fake.calls
 
     fake.calls.clear()
     config.write_text(
-        json.dumps({"agents": {"defaults": {"model": {"primary": "anthropic/claude"}}}}),
+        json.dumps({
+            "agents": {
+                "defaults": {"model": {"primary": "openai/gpt-6-astra"}},
+                "list": [{"id": "main", "model": "anthropic/claude"}],
+            }
+        }),
         encoding="utf-8",
     )
     assert web._prepare_openai_text_inference() == {
         "ok": True,
         "billingRoute": "other",
         "errorCode": "",
+        "runtimeModel": "anthropic/claude",
+        "authProfilePinned": False,
     }
     assert fake.calls == []
+
+
+def test_text_runtime_pin_overrides_existing_session_model_for_cli_and_gateway():
+    preflight = {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    }
+
+    assert web._text_model_argv(preflight) == [
+        "--model", "openai/gpt-6-astra@openai:work",
+    ]
+    assert web._text_model_headers(preflight) == {
+        "x-openclaw-model": "openai/gpt-6-astra@openai:work",
+    }
+
+
+def test_invalid_main_agent_model_fails_closed_instead_of_reusing_session_override(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": "anthropic/claude\ninvalid"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+
+    assert web._prepare_openai_text_inference() == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "model_route_unavailable",
+    }
+
+
+def test_cli_chat_run_passes_exact_runtime_model_as_argv(monkeypatch):
+    captured = {}
+
+    class FakeLock:
+        def __init__(self, _key):
+            pass
+
+        def acquire(self, timeout):
+            return timeout > 0
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(web, "_prepare_openai_text_inference", lambda: {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    })
+    monkeypatch.setattr(web, "_heal_openclaw_session", lambda _key: None)
+    monkeypatch.setattr(web, "_openclaw_session_id", lambda _key: "session-id")
+    monkeypatch.setattr(web, "_CrossProcLock", FakeLock)
+    monkeypatch.setattr(web, "_proxy_env", lambda: {})
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(stdout="OK")
+
+    monkeypatch.setattr(web.subprocess, "run", fake_run)
+
+    assert web.run_agent_sync("hello", timeout=30, session_id="safe-session") == "OK"
+    command = captured["cmd"]
+    assert command[command.index("--model") + 1] == "openai/gpt-6-astra@openai:work"
 
 
 def test_test_use_rejects_unknown_handle_as_400_without_echo(monkeypatch):

@@ -676,10 +676,15 @@ class OpenAIPlanAuthFacade:
             return "runtime_policy_unavailable"
         return ""
 
-    def _ensure_text_auth_order(self, auth_payload: Any, *, include_platform: bool) -> str:
+    def _ensure_text_auth_order(
+        self,
+        auth_payload: Any,
+        *,
+        include_platform: bool,
+    ) -> tuple[str, bool]:
         expected = self._profile_order(auth_payload, include_platform=include_platform)
         if not expected:
-            return "plan_auth_missing"
+            return "plan_auth_missing", False
         payload, error = self._run_json_readonly_with_cold_start_retry(
             [
                 "models", "auth", "order", "get",
@@ -687,14 +692,15 @@ class OpenAIPlanAuthFacade:
             ]
         )
         if error or not isinstance(payload, dict):
-            return "runtime_policy_unavailable"
+            return "runtime_policy_unavailable", False
         current = payload.get("order")
         if isinstance(current, list) and current == expected:
-            return ""
-        return self._apply_text_auth_order(
+            return "", False
+        policy_error = self._apply_text_auth_order(
             auth_payload,
             include_platform=include_platform,
         )
+        return policy_error, not policy_error
 
     def set_platform_fallback(self, enabled: bool) -> dict[str, Any]:
         """Apply an explicit text-routing policy without reading credential material."""
@@ -708,17 +714,39 @@ class OpenAIPlanAuthFacade:
         if not plan_order:
             raise InvalidRequestError("plan_auth_required")
         if enabled and full_order == plan_order:
-            raise InvalidRequestError("platform_credential_required")
+            status_payload, status_error = self._run_json_readonly_with_cold_start_retry(
+                ["models", "status", "--json"]
+            )
+            assessment = (
+                _credential_assessment(auth_payload, status_payload, _plan_profiles(auth_payload))
+                if not status_error
+                else None
+            )
+            if (
+                assessment is None
+                or assessment.error_code
+                or not assessment.platform_credential_present
+            ):
+                raise InvalidRequestError("platform_credential_required")
         error_code = self._apply_text_auth_order(
             auth_payload,
             include_platform=enabled,
         )
         if error_code:
             raise InvalidRequestError(error_code)
+        fresh_plans, fresh_assessment, fresh_error = self._fresh_text_evidence()
+        if fresh_error or fresh_assessment is None:
+            raise InvalidRequestError("runtime_policy_unavailable")
+        if fresh_assessment.error_code:
+            raise InvalidRequestError(fresh_assessment.error_code)
+        if not fresh_plans:
+            raise InvalidRequestError("plan_auth_required")
+        if enabled and not fresh_assessment.platform_credential_present:
+            raise InvalidRequestError("platform_credential_required")
         return {"ok": True, "platformFallbackEnabled": enabled}
 
-    def prepare_text_inference(self) -> dict[str, Any]:
-        """Reconcile the official per-agent OpenAI auth order before text use."""
+    def prepare_text_inference(self, model: str | None = None) -> dict[str, Any]:
+        """Reconcile policy and return the exact model ref for one text run."""
         plans, auth_payload, auth_error = self._current_plan_profiles()
         if auth_error:
             return {"ok": False, "billingRoute": "blocked", "errorCode": "local_runtime_unavailable"}
@@ -731,6 +759,10 @@ class OpenAIPlanAuthFacade:
         if assessment.error_code:
             return {"ok": False, "billingRoute": "blocked", "errorCode": assessment.error_code}
 
+        runtime_model = model or assessment.selected_model
+        if not isinstance(runtime_model, str) or not _MODEL_REF_RE.fullmatch(runtime_model):
+            return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
+
         fallback_enabled = self._fallback_enabled()
         if not plans:
             error_code = (
@@ -742,22 +774,79 @@ class OpenAIPlanAuthFacade:
         if all(bool(row["reauth_required"]) for row in plans):
             return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_reauth_required"}
 
-        policy_error = self._ensure_text_auth_order(
+        policy_error, policy_changed = self._ensure_text_auth_order(
             auth_payload,
             include_platform=fallback_enabled,
         )
         if policy_error:
             return {"ok": False, "billingRoute": "blocked", "errorCode": policy_error}
 
-        if assessment.effective_text_billing_route == "chatgpt_plan" and assessment.runtime_status == "usable":
-            return {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
-        if fallback_enabled and assessment.platform_credential_present:
+        if policy_changed:
+            fresh_plans, fresh_assessment, fresh_error = self._fresh_text_evidence()
+        else:
+            fresh_plans, fresh_assessment, fresh_error = plans, assessment, ""
+        if fresh_error or fresh_assessment is None:
+            return {"ok": False, "billingRoute": "blocked", "errorCode": "local_runtime_unavailable"}
+        if fresh_assessment.error_code:
+            return {
+                "ok": False,
+                "billingRoute": "blocked",
+                "errorCode": fresh_assessment.error_code,
+            }
+        if not fresh_plans:
+            return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_auth_missing"}
+
+        if (
+            fresh_assessment.effective_text_billing_route == "chatgpt_plan"
+            and fresh_assessment.runtime_status == "usable"
+        ):
+            if fallback_enabled:
+                return {
+                    "ok": True,
+                    "billingRoute": "chatgpt_plan",
+                    "errorCode": "",
+                    "runtimeModel": runtime_model,
+                    "authProfilePinned": False,
+                }
+            profile_id = fresh_assessment.exclusive_plan_profile_id
+            if not profile_id:
+                return {"ok": False, "billingRoute": "blocked", "errorCode": "billing_ambiguity"}
+            return {
+                "ok": True,
+                "billingRoute": "chatgpt_plan",
+                "errorCode": "",
+                "runtimeModel": f"{runtime_model}@{profile_id}",
+                "authProfilePinned": True,
+            }
+        if (
+            fallback_enabled
+            and fresh_assessment.effective_text_billing_route == "platform_api"
+            and fresh_assessment.runtime_status == "usable"
+        ):
             return {
                 "ok": True,
                 "billingRoute": "platform_fallback",
                 "errorCode": "platform_fallback_selected",
+                "runtimeModel": runtime_model,
+                "authProfilePinned": False,
             }
         return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_runtime_unavailable"}
+
+    def _fresh_text_evidence(
+        self,
+    ) -> tuple[list[dict[str, str | bool]], _CredentialAssessment | None, str]:
+        auth_payload, auth_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "auth", "list", "--provider", "openai", "--json"]
+        )
+        plans = _plan_profiles(auth_payload)
+        if auth_error:
+            return plans, None, auth_error
+        status_payload, status_error = self._run_json_readonly_with_cold_start_retry(
+            ["models", "status", "--json"]
+        )
+        if status_error:
+            return plans, None, status_error
+        return plans, _credential_assessment(auth_payload, status_payload, plans), ""
 
     def _auth_payload(self) -> tuple[Any | None, str]:
         return self._run_json(["models", "auth", "list", "--provider", "openai", "--json"])
@@ -769,13 +858,7 @@ class OpenAIPlanAuthFacade:
     def _current_credential_assessment(
         self,
     ) -> tuple[list[dict[str, str | bool]], _CredentialAssessment | None, str]:
-        plans, auth_payload, auth_error = self._current_plan_profiles()
-        if auth_error:
-            return plans, None, auth_error
-        status_payload, status_error = self._run_json(["models", "status", "--json"])
-        if status_error:
-            return plans, None, status_error
-        return plans, _credential_assessment(auth_payload, status_payload, plans), ""
+        return self._fresh_text_evidence()
 
     def _publish_profile_handles(self, plans: list[dict[str, str | bool]]) -> dict[str, str]:
         with self._lock:
@@ -1220,12 +1303,21 @@ class OpenAIPlanAuthFacade:
         if proof_error:
             return self._test_failure(proof_error)
         if assessment.platform_credential_present:
-            policy_error = self._ensure_text_auth_order(
+            policy_error, policy_changed = self._ensure_text_auth_order(
                 auth_payload,
                 include_platform=False,
             )
             if policy_error:
                 return self._test_failure(policy_error)
+            if policy_changed:
+                plans, fresh_assessment, fresh_error = self._fresh_text_evidence()
+                if fresh_error or fresh_assessment is None:
+                    return self._test_failure("billing_ambiguity")
+                if self._resolve_profile_handle(profile_handle, plans) != profile_id:
+                    return self._test_failure("billing_ambiguity")
+                proof_error = self._credential_proof_error(fresh_assessment, profile_id)
+                if proof_error:
+                    return self._test_failure(proof_error)
 
         # A fresh catalog check is intentionally separate from the profile
         # check above: both facts must still be true at mutation time.
@@ -1264,7 +1356,7 @@ class OpenAIPlanAuthFacade:
                 [
                     "agent", "exec", _TEST_PROMPT,
                     "--cwd", str(test_workspace),
-                    "--model", model,
+                    "--model", f"{model}@{profile_id}",
                     "--code-mode", "direct",
                     "--thinking", "off",
                     "--timeout", str(int(self._test_timeout)),

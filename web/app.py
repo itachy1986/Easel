@@ -83,6 +83,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
 OPENAI_PLATFORM_FALLBACK_ENV = "EASEL_OPENAI_PLATFORM_FALLBACK"
+_RUNTIME_MODEL_REF_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:@+\-/]{0,319}$"
+)
 OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
     profile=OPENCLAW_PROFILE,
     cwd=PROJECT_ROOT,
@@ -880,6 +883,7 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
     # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
     cmd = openclaw_base_cmd() + ['--profile', OPENCLAW_PROFILE, 'agent', '--agent', 'main',
            '--session-key', f'agent:main:{sk}', '--session-id', _openclaw_session_id(sk),
+           *_text_model_argv(preflight),
            '--thinking', THINKING_LEVEL,
            '--timeout', str(timeout), '--message', msg]
     # 跨进程锁：同一会话同时刻只跑一个 openclaw，防并发 takeover 崩溃（rc=1）
@@ -897,19 +901,75 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
         xlock.release()
 
 
-def _uses_canonical_openai_text() -> bool:
+def _primary_model_value(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict) and isinstance(value.get("primary"), str):
+        return value["primary"].strip()
+    return ""
+
+
+def _effective_main_agent_text_model() -> str:
     try:
         data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
-        primary = (((data.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary")
-        return isinstance(primary, str) and primary.startswith("openai/")
+        agents = data.get("agents") if isinstance(data, dict) else None
+        if not isinstance(agents, dict):
+            return ""
+        listed = agents.get("list")
+        if isinstance(listed, list):
+            for entry in listed:
+                if isinstance(entry, dict) and entry.get("id") == "main":
+                    primary = _primary_model_value(entry.get("model"))
+                    if primary:
+                        return primary
+                    break
+        entries = agents.get("entries")
+        if isinstance(entries, dict) and isinstance(entries.get("main"), dict):
+            primary = _primary_model_value(entries["main"].get("model"))
+            if primary:
+                return primary
+        defaults = agents.get("defaults")
+        return _primary_model_value(defaults.get("model")) if isinstance(defaults, dict) else ""
     except (OSError, ValueError, TypeError):
-        return False
+        return ""
+
+
+def _unpin_model(model: str) -> str:
+    slash = model.find("/")
+    profile = model.find("@", slash + 1) if slash >= 0 else -1
+    return model[:profile] if profile > slash else model
+
+
+def _text_model_argv(preflight: dict[str, object]) -> list[str]:
+    model = preflight.get("runtimeModel")
+    if not isinstance(model, str) or not _RUNTIME_MODEL_REF_RE.fullmatch(model):
+        return []
+    return ["--model", model]
+
+
+def _text_model_headers(preflight: dict[str, object]) -> dict[str, str]:
+    argv = _text_model_argv(preflight)
+    return {"x-openclaw-model": argv[1]} if argv else {}
 
 
 def _prepare_openai_text_inference() -> dict[str, object]:
-    if not _uses_canonical_openai_text():
-        return {"ok": True, "billingRoute": "other", "errorCode": ""}
-    return OPENAI_PLAN_AUTH.prepare_text_inference()
+    model = _effective_main_agent_text_model()
+    if not model:
+        return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
+    base_model = _unpin_model(model)
+    if not base_model.startswith("openai/"):
+        result = {
+            "ok": True,
+            "billingRoute": "other",
+            "errorCode": "",
+            "runtimeModel": model,
+            "authProfilePinned": False,
+        }
+    else:
+        result = OPENAI_PLAN_AUTH.prepare_text_inference(base_model)
+    if result.get("ok") and not _text_model_argv(result):
+        return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
+    return result
 
 
 def _text_policy_error(error_code: str) -> str:
@@ -921,6 +981,7 @@ def _text_policy_error(error_code: str) -> str:
         "billing_ambiguity": "❌ 无法确认本轮计费来源，已安全阻止。",
         "platform_fallback_disabled": "❌ ChatGPT Plan 不可用且 Platform fallback 已关闭，未产生 API 计费。",
         "runtime_policy_unavailable": "❌ 无法应用 OpenClaw 文本认证策略，已安全阻止。",
+        "model_route_unavailable": "❌ 无法确认 Main Agent 文本模型，已安全阻止。",
     }
     return safe.get(error_code, "❌ 无法安全确认本轮认证与计费来源，已阻止请求。")
 
@@ -2627,7 +2688,8 @@ async def api_chat_stream(req: ChatRequest):
             # 的话网关会自己另起一个 transcript —— 跨天空闲后丢历史，且万一本轮回退 CLI，
             # 两条路径会写进不同的会话文件，对话历史直接劈叉。
             headers = {"x-openclaw-session-key": f"agent:main:{sk}",
-                       "x-openclaw-session-id": _openclaw_session_id(sk)}
+                       "x-openclaw-session-id": _openclaw_session_id(sk),
+                       **_text_model_headers(preflight)}
             tool_noted = False
             saw_done = False
             got_text = False
@@ -2702,6 +2764,7 @@ async def api_chat_stream(req: ChatRequest):
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
             "--session-key", f"agent:main:{sk}", "--session-id", _openclaw_session_id(sk),
+            *_text_model_argv(preflight),
             "--thinking", THINKING_LEVEL,
             "--timeout", str(TIMEOUT_CHAT), "--message", message,
         ]

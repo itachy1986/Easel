@@ -125,6 +125,28 @@ def status_for_api_key():
     }
     payload["auth"]["runtimeAuthRoutes"][0]["effective"]["detail"] = "openai:api-key"
     return payload
+
+
+def status_with_provider_key(*, route="openai:work", runtime_status="usable"):
+    """OpenClaw metadata for a declared models.providers.openai.apiKey."""
+    payload = json.loads(json.dumps(STATUS))
+    provider = payload["auth"]["providers"][0]
+    provider["modelsJson"] = {
+        "source": "models.providers.openai.apiKey",
+        "value": "PROVIDER_KEY_SENTINEL",
+    }
+    runtime_route = payload["auth"]["runtimeAuthRoutes"][0]
+    runtime_route["status"] = runtime_status
+    if route == "provider-config":
+        runtime_route["effective"] = {
+            "kind": "models.json",
+            "detail": "models.providers.openai.apiKey",
+        }
+    else:
+        runtime_route["effective"] = {"kind": "profiles", "detail": route}
+    return payload
+
+
 CATALOG = {
     "count": 3,
     "models": [
@@ -446,7 +468,12 @@ def test_explicit_platform_fallback_keeps_plan_primary_and_exposes_charge_risk()
 )
 def test_platform_fallback_toggle_uses_official_per_agent_auth_order(enabled, expected_order):
     mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
-    runner = QueueRunner(result(mixed), ProcessResult(0, "updated", "", "completed"))
+    runner = QueueRunner(
+        result(mixed),
+        ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(status_with_saved_api_key()),
+    )
     auth = facade(runner)
 
     body = auth.set_platform_fallback(enabled)
@@ -490,13 +517,146 @@ def test_text_preflight_applies_plan_only_order_before_openai_inference():
         result(status_with_saved_api_key()),
         result({"order": []}),
         ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(status_with_saved_api_key()),
     )
 
     body = facade(runner).prepare_text_inference()
 
-    assert body == {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
-    assert runner.calls[-1][0][-1] == "openai:work"
-    assert "openai:api-key" not in runner.calls[-1][0]
+    assert body["ok"] is True
+    assert body["billingRoute"] == "chatgpt_plan"
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    policy_call = runner.calls[3][0]
+    assert policy_call[-1] == "openai:work"
+    assert "openai:api-key" not in policy_call
+
+
+def test_provider_config_key_off_returns_exact_plan_pin_after_fresh_policy_read():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN),
+        result(provider_key_status),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN),
+        result(provider_key_status),
+    )
+
+    body = facade(runner).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    }
+    policy_call = runner.calls[3][0]
+    assert policy_call[-1] == "openai:work"
+    assert not any(
+        part in {"config", "delete", "unset", "paste-api-key"}
+        for call, *_ in runner.calls
+        for part in call
+    )
+    assert "PROVIDER_KEY_SENTINEL" not in json.dumps(body)
+
+
+def test_post_policy_fresh_auth_read_uses_bounded_cold_start_retry():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN), result(provider_key_status),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        ProcessResult(-1, "SECRET", "Authorization: Bearer SECRET", "timeout"),
+        result(PLAN), result(provider_key_status),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body["ok"] is True
+    assert body["authProfilePinned"] is True
+    assert [call[1] for call in runner.calls] == [30, 30, 30, 30, 30, 45, 30]
+    assert "SECRET" not in json.dumps(body)
+
+
+def test_provider_config_key_off_blocks_when_plan_runtime_is_unavailable():
+    unavailable = status_with_provider_key(runtime_status="unavailable")
+    runner = QueueRunner(
+        result(PLAN), result(unavailable),
+        result({"order": ["openai:work"]}),
+        result(PLAN), result(unavailable),
+    )
+
+    body = facade(runner).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_runtime_unavailable",
+    }
+    assert not any("agent" in call for call, *_ in runner.calls)
+
+
+def test_provider_config_key_is_allowed_only_after_explicit_fallback_opt_in():
+    direct = status_with_provider_key(route="provider-config")
+    runner = QueueRunner(
+        result(PLAN), result(direct),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(
+        runner,
+        platform_fallback_enabled=True,
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": True,
+        "billingRoute": "platform_fallback",
+        "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
+    }
+    assert [call[0][-3:] for call in runner.calls].count(["models", "status", "--json"]) == 1
+
+
+def test_fallback_policy_does_not_claim_platform_from_credential_presence_alone():
+    unavailable = status_with_provider_key(runtime_status="unavailable")
+    runner = QueueRunner(
+        result(PLAN), result(unavailable),
+        result({"order": ["openai:work"]}),
+        result(PLAN), result(unavailable),
+    )
+
+    body = facade(
+        runner,
+        platform_fallback_enabled=True,
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_runtime_unavailable",
+    }
+
+
+def test_enabling_fallback_accepts_provider_config_key_without_api_key_profile():
+    direct = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN), result(direct),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(direct),
+    )
+
+    body = facade(runner).set_platform_fallback(True)
+
+    assert body == {"ok": True, "platformFallbackEnabled": True}
+    policy_call = runner.calls[2][0]
+    assert policy_call[-1] == "openai:work"
+    assert "openai:api-key" not in policy_call
 
 
 def test_text_preflight_does_not_rewrite_matching_auth_order():
@@ -509,9 +669,10 @@ def test_text_preflight_does_not_rewrite_matching_auth_order():
 
     body = facade(runner).prepare_text_inference()
 
-    assert body == {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
+    assert body["ok"] is True
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
     assert len(runner.calls) == 3
-    assert runner.calls[-1][0][-9:-1] == [
+    assert runner.calls[2][0][-9:-1] == [
         "models", "auth", "order", "get", "--agent", "main", "--provider", "openai",
     ]
 
@@ -530,7 +691,8 @@ def test_text_preflight_auth_order_read_retries_one_cold_start_timeout():
         cold_start_retry_timeout=45,
     ).prepare_text_inference()
 
-    assert body == {"ok": True, "billingRoute": "chatgpt_plan", "errorCode": ""}
+    assert body["ok"] is True
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
     assert [call[1] for call in runner.calls] == [30, 30, 30, 45]
     assert "SECRET" not in json.dumps(body)
 
@@ -539,11 +701,15 @@ def test_explicit_fallback_preflight_keeps_plan_first_and_reports_actual_selecti
     mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
     unavailable = status_with_saved_api_key()
     unavailable["auth"]["runtimeAuthRoutes"][0]["status"] = "unavailable"
+    platform_selected = status_with_saved_api_key()
+    platform_selected["auth"]["runtimeAuthRoutes"][0]["effective"]["detail"] = "openai:api-key"
     runner = QueueRunner(
         result(mixed),
         result(unavailable),
         result({"order": []}),
         ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(platform_selected),
     )
 
     body = facade(runner, platform_fallback_enabled=True).prepare_text_inference()
@@ -552,8 +718,10 @@ def test_explicit_fallback_preflight_keeps_plan_first_and_reports_actual_selecti
         "ok": True,
         "billingRoute": "platform_fallback",
         "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
     }
-    command = runner.calls[-1][0]
+    command = runner.calls[3][0]
     assert command[-2:] == ["openai:work", "openai:api-key"]
     assert not any(part in {"config", "paste-api-key", "logout"} for part in command)
 
@@ -1471,7 +1639,8 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
     turn_call = calls[8]
     assert turn_call[4:6] == ["agent", "exec"]
     assert turn_call[turn_call.index("--cwd") + 1] == r"C:\empty-test-workspace"
-    assert "--model" in turn_call and turn_call[turn_call.index("--model") + 1] == "openai/gpt-6-astra"
+    assert "--model" in turn_call
+    assert turn_call[turn_call.index("--model") + 1] == "openai/gpt-6-astra@openai:work"
     assert "--fallback" not in turn_call
     assert calls[11][-3:] == ["models", "set", "openai/gpt-6-astra"]
 
@@ -1489,6 +1658,7 @@ def test_saved_api_key_is_excluded_by_plan_only_order_during_test_use():
         result(mixed), result(status_with_saved_api_key()),
         result({"order": []}),
         ProcessResult(0, "updated", "", "completed"),
+        result(mixed), result(status_with_saved_api_key()),
         result(CATALOG),
         ProcessResult(0, "activated", "", "completed"),
         result(mixed), result(status_with_saved_api_key()),
@@ -1518,6 +1688,7 @@ def test_runtime_platform_key_is_dormant_under_plan_only_test_policy():
         result(PLAN), result(platform_status),
         result({"order": []}),
         ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(platform_status),
         result(CATALOG),
         ProcessResult(0, "activated", "", "completed"),
         result(PLAN), result(platform_status),
