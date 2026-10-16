@@ -14,6 +14,7 @@ from easel.openai_plan_auth import (
     BoundedProcessRunner,
     InteractiveAuthProcessRunner,
     InvalidRequestError,
+    MainModelConfigSnapshot,
     OpenAIPlanAuthFacade,
     ProcessResult,
 )
@@ -112,6 +113,41 @@ def status_with_saved_api_key():
         "labels": ["openai:work=OAuth", "openai:api-key=masked"],
     }
     return payload
+
+
+def status_for_api_key():
+    payload = status_with_saved_api_key()
+    payload["auth"]["providers"][0]["profiles"] = {
+        "count": 1,
+        "oauth": 0,
+        "token": 0,
+        "apiKey": 1,
+        "labels": ["openai:api-key=masked"],
+    }
+    payload["auth"]["runtimeAuthRoutes"][0]["effective"]["detail"] = "openai:api-key"
+    return payload
+
+
+def status_with_provider_key(*, route="openai:work", runtime_status="usable"):
+    """OpenClaw metadata for a declared models.providers.openai.apiKey."""
+    payload = json.loads(json.dumps(STATUS))
+    provider = payload["auth"]["providers"][0]
+    provider["modelsJson"] = {
+        "source": "models.providers.openai.apiKey",
+        "value": "PROVIDER_KEY_SENTINEL",
+    }
+    runtime_route = payload["auth"]["runtimeAuthRoutes"][0]
+    runtime_route["status"] = runtime_status
+    if route == "provider-config":
+        runtime_route["effective"] = {
+            "kind": "models.json",
+            "detail": "models.providers.openai.apiKey",
+        }
+    else:
+        runtime_route["effective"] = {"kind": "profiles", "detail": route}
+    return payload
+
+
 CATALOG = {
     "count": 3,
     "models": [
@@ -149,6 +185,18 @@ class QueueRunner:
 
 
 def facade(runner, **kwargs):
+    model_reader = kwargs.setdefault(
+        "main_model_reader",
+        lambda: "openai/gpt-6-astra@openai:work",
+    )
+    kwargs.setdefault(
+        "main_model_snapshot_reader",
+        lambda: MainModelConfigSnapshot(
+            path="agents.entries.main.model.primary",
+            value=model_reader(),
+            semantic_guard=("sanitized-config",),
+        ),
+    )
     return OpenAIPlanAuthFacade(
         profile="easel",
         base_cmd_factory=lambda: ["node.exe", r"C:\npm\openclaw.mjs"],
@@ -158,8 +206,8 @@ def facade(runner, **kwargs):
     )
 
 
-def mapped_facade(runner):
-    auth = facade(runner)
+def mapped_facade(runner, **kwargs):
+    auth = facade(runner, **kwargs)
     body = auth.status()
     return auth, body["profiles"][0]["handle"]
 
@@ -246,6 +294,12 @@ def test_status_normalizes_plan_without_raw_or_secrets():
         "displayLabel": "OpenAI plan",
         "selectedModel": "openai/gpt-6-astra",
         "runtimeStatus": "usable",
+        "planConnected": True,
+        "planReauthRequired": False,
+        "planRuntimeStatus": "usable",
+        "platformCredentialPresent": False,
+        "platformFallbackEnabled": False,
+        "effectiveTextBillingRoute": "chatgpt_plan",
         "errorCode": "",
         "recoveryAction": "",
         "deviceCodeWebSupported": False,
@@ -370,18 +424,397 @@ def test_status_does_not_retry_cli_unavailable():
     assert "SECRET" not in json.dumps(body)
 
 
-def test_api_key_is_not_plan_and_mixed_is_explicit():
-    auth = facade(QueueRunner(result(API_KEY), result(STATUS)))
+def test_api_key_is_not_plan_and_stored_platform_is_dormant_by_default():
+    auth = facade(QueueRunner(result(API_KEY), result(status_for_api_key())))
     only_key = auth.status()
     assert only_key["connected"] is False
     assert only_key["usable"] is False
     assert only_key["billingSource"] == "platform_api"
 
     mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
-    body = facade(QueueRunner(result(mixed), result(STATUS))).status()
+    body = facade(QueueRunner(result(mixed), result(status_with_saved_api_key()))).status()
     assert body["connected"] is True
-    assert body["billingSource"] == "mixed"
+    assert body["billingSource"] == "chatgpt_plan"
+    assert body["platformCredentialPresent"] is True
+    assert body["platformFallbackEnabled"] is False
     assert body["activeProfileHandle"].startswith("plan_")
+
+
+def test_stored_platform_credential_is_dormant_when_text_fallback_is_disabled():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+
+    body = facade(QueueRunner(result(mixed), result(status_with_saved_api_key()))).status()
+
+    assert body["planConnected"] is True
+    assert body["planReauthRequired"] is False
+    assert body["planRuntimeStatus"] == "usable"
+    assert body["platformCredentialPresent"] is True
+    assert body["platformFallbackEnabled"] is False
+    assert body["effectiveTextBillingRoute"] == "chatgpt_plan"
+    assert body["billingSource"] == "chatgpt_plan"
+    assert body["usable"] is True
+    assert body["errorCode"] == ""
+
+
+def test_explicit_platform_fallback_keeps_plan_primary_and_exposes_charge_risk():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+
+    body = facade(
+        QueueRunner(result(mixed), result(status_with_saved_api_key())),
+        platform_fallback_enabled=lambda: True,
+    ).status()
+
+    assert body["planConnected"] is True
+    assert body["platformCredentialPresent"] is True
+    assert body["platformFallbackEnabled"] is True
+    assert body["effectiveTextBillingRoute"] == "chatgpt_plan"
+    assert body["billingSource"] == "chatgpt_plan"
+    assert body["errorCode"] == ""
+
+
+@pytest.mark.parametrize(
+    ("enabled", "expected_order"),
+    [
+        (False, ["openai:work"]),
+        (True, ["openai:work", "openai:api-key"]),
+    ],
+)
+def test_platform_fallback_toggle_uses_official_per_agent_auth_order(enabled, expected_order):
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    runner = QueueRunner(
+        result(mixed),
+        ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(status_with_saved_api_key()),
+    )
+    auth = facade(runner)
+
+    body = auth.set_platform_fallback(enabled)
+
+    assert body == {"ok": True, "platformFallbackEnabled": enabled}
+    command = runner.calls[1][0]
+    policy_start = command.index("models")
+    assert command[policy_start:policy_start + 8] == [
+        "models", "auth", "order", "set", "--agent", "main", "--provider", "openai",
+    ]
+    assert command[policy_start + 8:] == expected_order
+
+
+def test_platform_fallback_cannot_be_enabled_from_platform_credential_alone():
+    runner = QueueRunner(result(API_KEY))
+
+    with pytest.raises(InvalidRequestError, match="plan_auth_required"):
+        facade(runner).set_platform_fallback(True)
+
+    assert len(runner.calls) == 1
+    assert not any("order" in call[0] for call in runner.calls)
+
+
+def test_text_preflight_fails_closed_when_only_platform_exists_and_fallback_is_off():
+    runner = QueueRunner(result(API_KEY), result(status_for_api_key()))
+
+    body = facade(runner).prepare_text_inference()
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "platform_fallback_disabled",
+    }
+    assert len(runner.calls) == 2
+
+
+def test_text_preflight_applies_plan_only_order_before_openai_inference():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    runner = QueueRunner(
+        result(mixed),
+        result(status_with_saved_api_key()),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(status_with_saved_api_key()),
+    )
+
+    body = facade(runner).prepare_text_inference()
+
+    assert body["ok"] is True
+    assert body["billingRoute"] == "chatgpt_plan"
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    policy_call = runner.calls[3][0]
+    assert policy_call[-1] == "openai:work"
+    assert "openai:api-key" not in policy_call
+
+
+def test_provider_config_key_off_blocks_unpinned_main_model_without_running_agent():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN),
+        result(provider_key_status),
+    )
+
+    body = facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    }
+    assert not any("agent" in call for call, *_ in runner.calls)
+    assert "PROVIDER_KEY_SENTINEL" not in json.dumps(body)
+
+
+def test_provider_config_key_off_accepts_only_exact_persisted_plan_pin():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN),
+        result(provider_key_status),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(runner).prepare_text_inference(
+        "openai/gpt-6-astra@openai:work"
+    )
+
+    assert body == {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("persisted", "requested"),
+    [
+        ("openai/gpt-6-astra@openai:other", "openai/gpt-6-astra@openai:other"),
+        ("openai/gpt-other@openai:work", "openai/gpt-6-astra@openai:work"),
+        ("openai/gpt-6-astra@", "openai/gpt-6-astra@"),
+    ],
+)
+def test_plan_only_preflight_rejects_wrong_or_invalid_persisted_pin(
+    persisted, requested
+):
+    runner = QueueRunner(result(PLAN), result(STATUS))
+
+    body = facade(
+        runner,
+        main_model_reader=lambda: persisted,
+    ).prepare_text_inference(requested)
+
+    assert body["ok"] is False
+    assert body["billingRoute"] == "blocked"
+    assert body["errorCode"] in {"plan_activation_required", "model_route_unavailable"}
+    assert not any("agent" in call for call, *_ in runner.calls)
+
+
+def test_plan_only_preflight_blocks_if_persisted_pin_changes_during_policy_reconcile():
+    persisted = iter([
+        "openai/gpt-6-astra@openai:work",
+        "openai/gpt-6-astra@openai:other",
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
+    )
+
+    body = facade(
+        runner,
+        main_model_reader=lambda: next(persisted),
+    ).prepare_text_inference("openai/gpt-6-astra@openai:work")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    }
+
+
+def test_post_policy_fresh_auth_read_uses_bounded_cold_start_retry():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN), result(provider_key_status),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        ProcessResult(-1, "SECRET", "Authorization: Bearer SECRET", "timeout"),
+        result(PLAN), result(provider_key_status),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).prepare_text_inference("openai/gpt-6-astra@openai:work")
+
+    assert body["ok"] is True
+    assert body["authProfilePinned"] is True
+    assert [call[1] for call in runner.calls] == [30, 30, 30, 30, 30, 45, 30]
+    assert "SECRET" not in json.dumps(body)
+
+
+def test_provider_config_key_off_blocks_when_plan_runtime_is_unavailable():
+    unavailable = status_with_provider_key(runtime_status="unavailable")
+    runner = QueueRunner(
+        result(PLAN), result(unavailable),
+        result({"order": ["openai:work"]}),
+        result(PLAN), result(unavailable),
+    )
+
+    body = facade(runner).prepare_text_inference("openai/gpt-6-astra@openai:work")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_runtime_unavailable",
+    }
+    assert not any("agent" in call for call, *_ in runner.calls)
+
+
+def test_provider_config_key_is_allowed_only_after_explicit_fallback_opt_in():
+    direct = status_with_provider_key(route="provider-config")
+    runner = QueueRunner(
+        result(PLAN), result(direct),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(
+        runner,
+        platform_fallback_enabled=True,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": True,
+        "billingRoute": "platform_fallback",
+        "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
+    }
+    assert [call[0][-3:] for call in runner.calls].count(["models", "status", "--json"]) == 1
+
+
+def test_fallback_policy_does_not_claim_platform_from_credential_presence_alone():
+    unavailable = status_with_provider_key(runtime_status="unavailable")
+    runner = QueueRunner(
+        result(PLAN), result(unavailable),
+        result({"order": ["openai:work"]}),
+        result(PLAN), result(unavailable),
+    )
+
+    body = facade(
+        runner,
+        platform_fallback_enabled=True,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_runtime_unavailable",
+    }
+
+
+def test_enabling_fallback_accepts_provider_config_key_without_api_key_profile():
+    direct = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN), result(direct),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(direct),
+    )
+
+    body = facade(runner).set_platform_fallback(True)
+
+    assert body == {"ok": True, "platformFallbackEnabled": True}
+    policy_call = runner.calls[2][0]
+    assert policy_call[-1] == "openai:work"
+    assert "openai:api-key" not in policy_call
+
+
+def test_text_preflight_does_not_rewrite_matching_auth_order():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    runner = QueueRunner(
+        result(mixed),
+        result(status_with_saved_api_key()),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(runner).prepare_text_inference()
+
+    assert body["ok"] is True
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    assert len(runner.calls) == 3
+    assert runner.calls[2][0][-9:-1] == [
+        "models", "auth", "order", "get", "--agent", "main", "--provider", "openai",
+    ]
+
+
+def test_text_preflight_auth_order_read_retries_one_cold_start_timeout():
+    runner = QueueRunner(
+        result(PLAN),
+        result(STATUS),
+        ProcessResult(-1, "SECRET", "Authorization: Bearer SECRET", "timeout"),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(
+        runner,
+        command_timeout=30,
+        cold_start_retry_timeout=45,
+    ).prepare_text_inference()
+
+    assert body["ok"] is True
+    assert body["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    assert [call[1] for call in runner.calls] == [30, 30, 30, 45]
+    assert "SECRET" not in json.dumps(body)
+
+
+def test_explicit_fallback_preflight_keeps_plan_first_and_reports_actual_selection():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    unavailable = status_with_saved_api_key()
+    unavailable["auth"]["runtimeAuthRoutes"][0]["status"] = "unavailable"
+    platform_selected = status_with_saved_api_key()
+    platform_selected["auth"]["runtimeAuthRoutes"][0]["effective"]["detail"] = "openai:api-key"
+    runner = QueueRunner(
+        result(mixed),
+        result(unavailable),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(mixed),
+        result(platform_selected),
+    )
+
+    body = facade(runner, platform_fallback_enabled=True).prepare_text_inference()
+
+    assert body == {
+        "ok": True,
+        "billingRoute": "platform_fallback",
+        "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
+    }
+    command = runner.calls[3][0]
+    assert command[-2:] == ["openai:work", "openai:api-key"]
+    assert not any(part in {"config", "paste-api-key", "logout"} for part in command)
+
+
+def test_test_use_fails_closed_while_platform_fallback_is_enabled():
+    mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    runner = QueueRunner(
+        result(mixed), result(status_with_saved_api_key()),
+        result(mixed), result(status_with_saved_api_key()),
+    )
+    auth = facade(runner, platform_fallback_enabled=True)
+    status = auth.status()
+
+    body = auth.test_and_use(status["activeProfileHandle"], "openai/gpt-6-astra")
+
+    assert body["ok"] is False
+    assert body["errorCode"] == "platform_fallback_enabled"
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
 
 
 def test_runtime_unavailable_with_mixed_credentials_does_not_require_reauth():
@@ -399,9 +832,9 @@ def test_runtime_unavailable_with_mixed_credentials_does_not_require_reauth():
     assert body["reauthRequired"] is False
     assert body["usable"] is False
     assert body["runtimeStatus"] == "unavailable"
-    assert body["billingSource"] == "mixed"
-    assert body["errorCode"] == "platform_fallback_present"
-    assert body["recoveryAction"] == "review_openai_billing_sources"
+    assert body["billingSource"] == "chatgpt_plan"
+    assert body["errorCode"] == ""
+    assert body["recoveryAction"] == ""
 
 
 def test_runtime_missing_alone_does_not_require_reauth():
@@ -430,11 +863,14 @@ def test_runtime_missing_alone_does_not_require_reauth():
         ),
     ],
 )
-def test_status_never_labels_runtime_platform_evidence_as_plan_only(platform_status):
+def test_status_separates_dormant_platform_evidence_from_active_plan_route(platform_status):
     body = facade(QueueRunner(result(PLAN), result(platform_status))).status()
-    assert body["billingSource"] == "mixed"
-    assert body["usable"] is False
-    assert body["errorCode"] == "platform_fallback_present"
+    assert body["billingSource"] == "chatgpt_plan"
+    assert body["effectiveTextBillingRoute"] == "chatgpt_plan"
+    assert body["platformCredentialPresent"] is True
+    assert body["platformFallbackEnabled"] is False
+    assert body["usable"] is True
+    assert body["errorCode"] == ""
 
 
 @pytest.mark.parametrize("evidence", ["expired", "unusable", "reauthRequired", "requiresReauth"])
@@ -1204,7 +1640,11 @@ def test_catalog_filters_provider_and_fields_and_fails_closed():
     stale = facade(QueueRunner(result(PLAN), result(STATUS), result({"stale": True, "models": CATALOG["models"]}))).models()
     assert stale == {"status": "stale", "models": [], "errorCode": "catalog_stale"}
     empty = facade(QueueRunner(result(PLAN), result(STATUS), result({"models": []}))).models()
-    assert empty == {"status": "empty", "models": [], "errorCode": "catalog_empty"}
+    assert empty == {
+        "status": "empty",
+        "models": [],
+        "errorCode": "plan_entitlement_unavailable",
+    }
     unavailable = facade(QueueRunner(result(PLAN), result(STATUS), ProcessResult(1, "", "SECRET", "completed"))).models()
     assert unavailable == {"status": "unavailable", "models": [], "errorCode": "catalog_unavailable"}
 
@@ -1214,24 +1654,25 @@ def test_catalog_requires_current_plan_profile():
     assert body == {"status": "unavailable", "models": [], "errorCode": "plan_auth_required"}
 
 
-def test_mixed_catalog_fails_closed_without_discovery():
+def test_dormant_platform_profile_does_not_block_plan_catalog():
     mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
-    runner = QueueRunner(result(mixed), result(status_with_saved_api_key()))
+    runner = QueueRunner(result(mixed), result(status_with_saved_api_key()), result(CATALOG))
     body = facade(runner).models()
-    assert body == {"status": "unavailable", "models": [], "errorCode": "platform_fallback_present"}
-    assert len(runner.calls) == 2
+    assert body["status"] == "available"
+    assert body["models"][0]["ref"] == "openai/gpt-6-astra"
+    assert len(runner.calls) == 3
 
 
-def test_runtime_platform_evidence_blocks_catalog_without_entitlement_rows():
+def test_dormant_runtime_platform_evidence_does_not_block_plan_catalog():
     platform_status = status_with_openai(
         env={"value": "TOKEN_SENTINEL", "source": "OPENAI_API_KEY"},
         effective={"kind": "env", "detail": "TOKEN_SENTINEL"},
     )
-    runner = QueueRunner(result(PLAN), result(platform_status))
+    runner = QueueRunner(result(PLAN), result(platform_status), result(CATALOG))
     body = facade(runner).models()
-    assert body == {"status": "unavailable", "models": [], "errorCode": "platform_fallback_present"}
+    assert body["status"] == "available"
     assert "TOKEN_SENTINEL" not in json.dumps(body)
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 3
 
 
 def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
@@ -1240,7 +1681,6 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
         "status": "ok",
         "provider": "openai",
         "model": "gpt-6-astra",
-        "authProfileId": "openai:work",
     }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
@@ -1251,7 +1691,6 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
         result(PLAN), result(STATUS),
         result(turn),
         result(PLAN), result(STATUS),
-        ProcessResult(0, "set", "", "completed"),
     )
     auth, handle = mapped_facade(runner)
 
@@ -1269,29 +1708,53 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
     assert calls[2][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
     assert calls[3][-3:] == ["models", "status", "--json"]
     assert calls[4][-5:] == ["models", "list", "--provider", "openai", "--json"]
-    assert calls[5][-4:] == ["models", "auth", "activate", "openai:work"]
+    assert calls[5][-7:] == [
+        "config", "set", "agents.entries.main.model.primary",
+        '"openai/gpt-6-astra@openai:work"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-6-astra@openai:work"',
+    ]
+    assert not any(call[-4:-1] == ["models", "auth", "activate"] for call in calls)
     turn_call = calls[8]
     assert turn_call[4:6] == ["agent", "exec"]
     assert turn_call[turn_call.index("--cwd") + 1] == r"C:\empty-test-workspace"
-    assert "--model" in turn_call and turn_call[turn_call.index("--model") + 1] == "openai/gpt-6-astra"
+    assert "--model" in turn_call
+    assert turn_call[turn_call.index("--model") + 1] == "openai/gpt-6-astra@openai:work"
     assert "--fallback" not in turn_call
-    assert calls[11][-3:] == ["models", "set", "openai/gpt-6-astra"]
+    assert not any(call[-3:-1] == ["models", "set"] for call in calls)
 
 
-def test_saved_api_key_blocks_test_use_before_catalog_inference_or_persist():
+def test_saved_api_key_is_excluded_by_plan_only_order_during_test_use():
     mixed = {"profiles": PLAN["profiles"] + API_KEY["profiles"]}
+    turn = {
+        "ok": True,
+        "provider": "openai",
+        "model": "gpt-6-astra",
+    }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
+        result(mixed), result(status_with_saved_api_key()),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(mixed), result(status_with_saved_api_key()),
+        result(CATALOG),
+        ProcessResult(0, "activated", "", "completed"),
+        result(mixed), result(status_with_saved_api_key()),
+        result(turn),
         result(mixed), result(status_with_saved_api_key()),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
-    assert body["ok"] is False
-    assert body["errorCode"] == "platform_fallback_present"
-    assert len(runner.calls) == 4
+    assert body["ok"] is True
+    policy_call = next(
+        call[0]
+        for call in runner.calls
+        if "order" in call[0] and "set" in call[0]
+    )
+    assert policy_call[-1] == "openai:work"
+    assert "openai:api-key" not in policy_call
 
 
-def test_runtime_platform_key_blocks_test_use_before_inference():
+def test_runtime_platform_key_is_dormant_under_plan_only_test_policy():
     platform_status = status_with_openai(
         modelsJson={"value": "TOKEN_SENTINEL", "source": "models.json: <safe>"},
         effective={"kind": "models.json", "detail": "TOKEN_SENTINEL"},
@@ -1299,13 +1762,23 @@ def test_runtime_platform_key_blocks_test_use_before_inference():
     runner = QueueRunner(
         result(PLAN), result(STATUS),
         result(PLAN), result(platform_status),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(platform_status),
+        result(CATALOG),
+        ProcessResult(0, "activated", "", "completed"),
+        result(PLAN), result(platform_status),
+        result({
+            "ok": True,
+            "provider": "openai",
+            "model": "gpt-6-astra",
+        }),
+        result(PLAN), result(platform_status),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
-    assert body["ok"] is False
-    assert body["errorCode"] == "platform_fallback_present"
+    assert body["ok"] is True
     assert "TOKEN_SENTINEL" not in json.dumps(body)
-    assert len(runner.calls) == 4
 
 
 def test_unusable_requested_plan_profile_never_runs_inference():
@@ -1366,39 +1839,85 @@ def test_activation_must_confirm_requested_profile_before_inference():
     assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
 
 
-@pytest.mark.parametrize(
-    "credential_fields",
-    [
-        {"authProfileId": "openai:api-key"},
-        {"authProfileId": "openai:work", "credentialSource": "api_key"},
-    ],
-)
-def test_wrong_actual_profile_identity_or_source_cannot_pass_or_persist(credential_fields):
-    turn = {
-        "ok": True,
-        "provider": "openai",
-        "model": "gpt-6-astra",
-        **credential_fields,
-    }
+def test_activation_exit_zero_without_exact_persisted_pin_never_runs_inference():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "activated", "", "completed"),
+        result(PLAN), result(STATUS),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["ok"] is False
+    assert body["errorCode"] == "profile_activation_unconfirmed"
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_agent_exec_stable_envelope_needs_no_invented_profile_field():
+    turn = {"ok": True, "provider": "openai", "model": "gpt-6-astra"}
     runner = QueueRunner(
         result(PLAN), result(STATUS),
         result(PLAN), result(STATUS), result(CATALOG),
         ProcessResult(0, "", "", "completed"),
         result(PLAN), result(STATUS), result(turn),
+        result(PLAN), result(STATUS),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
-    assert body["ok"] is False
-    assert body["errorCode"] == "credential_proof_mismatch"
+    assert body["ok"] is True
     assert not any(call[0][-3:-1] == ["models", "set"] for call in runner.calls)
 
 
-def test_credential_source_added_during_turn_blocks_persist():
+def test_activation_model_must_match_requested_model_before_agent_exec():
+    activated_other = json.loads(json.dumps(STATUS))
+    activated_other["defaultModel"] = "openai/gpt-other"
+    activated_other["resolvedDefault"] = "openai/gpt-other"
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "", "", "completed"),
+        result(PLAN), result(activated_other),
+    )
+    auth, handle = mapped_facade(runner)
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-other@openai:work",
+            ("sanitized-config",),
+        ),
+    ])
+    auth._main_model_snapshot_reader = lambda: next(states)
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+    assert body == {
+        "ok": False,
+        "selectedModel": "",
+        "effectiveProvider": "",
+        "testResult": "fail",
+        "errorCode": "profile_model_mismatch",
+    }
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_platform_route_result_after_turn_cannot_count_as_plan_proof():
     turn = {"ok": True, "provider": "openai", "model": "gpt-6-astra"}
     platform_status = status_with_openai(
         env={"value": "sk-…masked", "source": "OPENAI_API_KEY"},
         effective={"kind": "env", "detail": "sk-…masked"},
     )
+    platform_status["auth"]["runtimeAuthRoutes"][0]["effective"] = {
+        "kind": "env",
+        "detail": "OPENAI_API_KEY",
+    }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
         result(PLAN), result(STATUS), result(CATALOG),
@@ -1409,7 +1928,7 @@ def test_credential_source_added_during_turn_blocks_persist():
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is False
-    assert body["errorCode"] == "platform_fallback_present"
+    assert body["errorCode"] == "billing_ambiguity"
     assert not any(call[0][-3:-1] == ["models", "set"] for call in runner.calls)
 
 
@@ -1448,8 +1967,9 @@ def test_test_use_rejects_stale_profile_and_model_before_activation():
         result(PLAN), result(STATUS), result(CATALOG),
     )
     auth, handle = mapped_facade(runner)
-    with pytest.raises(InvalidRequestError):
-        auth.test_and_use(handle, "openai/not-entitled")
+    body = auth.test_and_use(handle, "openai/not-entitled")
+    assert body["ok"] is False
+    assert body["errorCode"] == "plan_model_unavailable"
     assert not any("activate" in call[0] for call in runner.calls)
 
 
@@ -1473,7 +1993,6 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
         "ok": True,
         "provider": "openai",
         "model": "gpt-6-astra",
-        "authProfileId": SENSITIVE_PROFILE_ID,
     }
     runner = QueueRunner(
         result(SENSITIVE_PLAN), result(status),
@@ -1481,14 +2000,228 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
         ProcessResult(0, "", "", "completed"),
         result(SENSITIVE_PLAN), result(status), result(turn),
         result(SENSITIVE_PLAN), result(status),
-        ProcessResult(0, "", "", "completed"),
     )
-    auth, handle = mapped_facade(runner)
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: (
+            "openai/gpt-6-astra@openai:user@example.com"
+        ),
+    )
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is True
     assert SENSITIVE_PROFILE_ID not in json.dumps(body)
-    activate = next(call[0] for call in runner.calls if "activate" in call[0])
-    assert activate[-1] == SENSITIVE_PROFILE_ID
+    mutation = next(call[0] for call in runner.calls if "config" in call[0] and "set" in call[0])
+    assert mutation[-7:] == [
+        "config", "set", "agents.entries.main.model.primary",
+        json.dumps(f"openai/gpt-6-astra@{SENSITIVE_PROFILE_ID}"), "--strict-json",
+        "--expect-current-json",
+        json.dumps(f"openai/gpt-6-astra@{SENSITIVE_PROFILE_ID}"),
+    ]
+    assert not any("activate" in call[0] for call in runner.calls)
+
+
+def test_failed_one_shot_restores_only_owned_model_pin_with_cas():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("sanitized-config",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
+        result({"ok": False, "provider": "openai", "model": "gpt-6-astra"}),
+        ProcessResult(0, "restored", "", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_test_unproven"
+    mutations = [call[0] for call in runner.calls if "config" in call[0] and "set" in call[0]]
+    assert mutations[0][-4:] == [
+        '"openai/gpt-6-astra@openai:work"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-old"',
+    ]
+    assert mutations[1][-4:] == [
+        '"openai/gpt-old"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-6-astra@openai:work"',
+    ]
+
+
+def test_non_target_config_change_fails_closed_without_exposing_guard(capsys):
+    baseline_guard = ("credential-proof-alpha",)
+    changed_guard = ("credential-proof-beta",)
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            baseline_guard,
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            changed_guard,
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            changed_guard,
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        ProcessResult(0, "restored", "", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "config_concurrent_update"
+    assert "credential-proof" not in json.dumps(body)
+    captured = capsys.readouterr()
+    assert "credential-proof" not in captured.out
+    assert "credential-proof" not in captured.err
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_stale_model_pin_cas_never_runs_inference_or_blanket_restore():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(1, "", "conditional expectation did not match", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_conflict"
+    mutations = [call[0] for call in runner.calls if "config" in call[0] and "set" in call[0]]
+    assert len(mutations) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_interrupted_model_pin_never_runs_inference_or_rollback():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(-1, "", "", "timeout"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_conflict"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_interrupted_model_pin_with_changed_state_reports_unknown_without_rollback():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("baseline",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(-1, "", "", "timeout"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_outcome_unknown"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_failed_turn_reports_rollback_conflict_without_overwriting_concurrent_model():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/concurrent@openai:work",
+            ("concurrent",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
+        result({"ok": False, "provider": "openai", "model": "gpt-6-astra"}),
+        ProcessResult(1, "", "conditional expectation did not match", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_rollback_conflict"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 2
 
 
 def test_public_handle_is_bound_to_current_profile_snapshot():
@@ -1519,12 +2252,15 @@ def test_test_use_readonly_checks_do_not_use_cold_start_retry_budget():
     assert [call[1] for call in runner.calls] == [30, 30, 30]
 
 
-def test_no_api_key_mutation_or_auth_order_commands_exist_in_facade_source():
+def test_facade_only_uses_auth_order_for_explicit_text_policy():
     import inspect
 
     source = inspect.getsource(OpenAIPlanAuthFacade)
     assert "paste-api-key" not in source
-    assert "auth order" not in source
+    assert '"auth", "order", "set"' in source
+    assert '"auth", "order", "clear"' not in source
+    assert '"auth", "activate"' not in source
+    assert '"--expect-current-json"' in source
     assert "--force" not in source
     assert "--set-default" not in source
 

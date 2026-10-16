@@ -15,15 +15,18 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
   const plan = useChatGPTPlan(onSummaryChange);
   const {
     status, catalog, job, selectedModel, setSelectedModel, loading, catalogLoading,
-    testing, message, messageKind, copyNote, openAIModels, busy, canTest,
+    testing, fallbackUpdating, message, messageKind, copyNote, openAIModels, busy, canTest,
     terminalCommand, startConnect, cancelJob, refreshCatalog, testAndUse,
-    copyDeviceCommand, copyInteractiveCommand,
+    copyDeviceCommand, copyInteractiveCommand, updatePlatformFallback,
   } = plan;
 
   const riskCopy = (() => {
     if (!status) return '';
-    if (status.billingSource === 'mixed' || status.errorCode === 'platform_fallback_present') {
-      return '检测到 ChatGPT Plan 与 OpenAI Platform credential 同时存在。为避免意外 API 计费，Test & use 已禁用。';
+    if (status.platformFallbackEnabled) {
+      return 'Platform fallback 已明确启用：ChatGPT Plan 不可用时可能产生 OpenAI Platform API 费用。';
+    }
+    if (status.platformCredentialPresent && status.planConnected) {
+      return '已检测到 Platform credential，但文本 fallback 当前关闭；ChatGPT Plan 仍为唯一允许的文本计费路径。';
     }
     if (status.billingSource === 'platform_api') {
       return '检测到 OpenAI Platform credential。你仍可登录 ChatGPT Plan；在 Platform 计费来源未被安全隔离前，Easel 不会启用 Test & use。';
@@ -37,7 +40,7 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
 
   const statusView = (() => {
     if (loading) return { cls: 'off', label: '检查中' };
-    if (isExclusivePlanUsable(status)) return { cls: 'ok', label: 'Connected' };
+    if (status?.usable && status.effectiveTextBillingRoute === 'chatgpt_plan') return { cls: 'ok', label: 'Connected' };
     if (status?.reauthRequired) return { cls: 'warn', label: '需要重新登录' };
     if (status?.billingSource === 'platform_api') return { cls: 'warn', label: 'Platform API' };
     if (status?.connected) return { cls: 'warn', label: '已登录 · 需检查' };
@@ -89,6 +92,23 @@ export default function ChatGPTPlanCard({ onSummaryChange }: Props) {
         </div>
 
         {riskCopy ? <div className="plan-notice risk" data-testid="plan-risk" role="alert">{riskCopy}</div> : null}
+
+        {status?.platformCredentialPresent ? (
+          <label className="plan-fallback-control">
+            <input
+              type="checkbox"
+              checked={status.platformFallbackEnabled}
+              disabled={fallbackUpdating || busy || !status.planConnected}
+              onChange={(event) => void updatePlatformFallback(event.target.checked)}
+            />
+            <span>
+              <strong>允许 Platform API 文本 fallback</strong>
+              <small>{status.planConnected
+                ? '仅在 ChatGPT Plan 不可用时使用；可能产生 OpenAI Platform API 费用。'
+                : '请先连接 ChatGPT Plan；启用后可能产生 OpenAI Platform API 费用。'}</small>
+            </span>
+          </label>
+        ) : null}
 
         {busy ? (
           <div className="plan-connect" data-testid="plan-connecting" role="status">

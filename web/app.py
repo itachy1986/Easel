@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+import hmac
 import os
 if os.name == "nt":
     import msvcrt
@@ -45,6 +47,7 @@ from easel.openai_plan_auth import (
     ActiveJobError,
     InvalidRequestError as OpenAIPlanInvalidRequest,
     JobNotFoundError,
+    MainModelConfigSnapshot,
     OpenAIPlanAuthFacade,
 )
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
@@ -82,9 +85,16 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
+OPENAI_PLATFORM_FALLBACK_ENV = "EASEL_OPENAI_PLATFORM_FALLBACK"
+_RUNTIME_MODEL_REF_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:@+\-/]{0,319}$"
+)
 OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
     profile=OPENCLAW_PROFILE,
     cwd=PROJECT_ROOT,
+    platform_fallback_enabled=lambda: _platform_fallback_enabled(),
+    main_model_reader=lambda: _effective_main_agent_text_model(),
+    main_model_snapshot_reader=lambda: _main_agent_model_config_snapshot(),
 )
 # 对话传输层：http＝直连常驻 gateway 的 OpenAI 兼容端点，agent 在 gateway 进程里直接跑，
 # 省掉每轮 spawn `openclaw agent` 瘦客户端的冷启动（本机实测同一句话：CLI 7.1-7.6s/轮，
@@ -696,6 +706,13 @@ def _read_env() -> dict[str, str]:
     return result
 
 
+def _platform_fallback_enabled() -> bool:
+    """Non-secret, explicit opt-in. Missing/invalid values always mean OFF."""
+    return _read_env().get(OPENAI_PLATFORM_FALLBACK_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _is_set(val: str | None) -> bool:
     """非空且非占位符才算真正配置了。"""
     if not val or not val.strip():
@@ -863,11 +880,15 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
 
 
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
+    preflight = _prepare_openai_text_inference()
+    if not preflight["ok"]:
+        return _text_policy_error(preflight["errorCode"])
     sk = session_id or f'web-{int(time.time() * 1000)}'
     _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效
     # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
     cmd = openclaw_base_cmd() + ['--profile', OPENCLAW_PROFILE, 'agent', '--agent', 'main',
            '--session-key', f'agent:main:{sk}', '--session-id', _openclaw_session_id(sk),
+           *_text_model_argv(preflight),
            '--thinking', THINKING_LEVEL,
            '--timeout', str(timeout), '--message', msg]
     # 跨进程锁：同一会话同时刻只跑一个 openclaw，防并发 takeover 崩溃（rc=1）
@@ -883,6 +904,265 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
         return f'❌ {e}'
     finally:
         xlock.release()
+
+
+def _primary_model_value(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict) and isinstance(value.get("primary"), str):
+        return value["primary"].strip()
+    return ""
+
+
+def _effective_main_agent_text_model() -> str:
+    try:
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+        agents = data.get("agents") if isinstance(data, dict) else None
+        if not isinstance(agents, dict):
+            return ""
+        listed = agents.get("list")
+        if isinstance(listed, list):
+            for entry in listed:
+                if isinstance(entry, dict) and entry.get("id") == "main":
+                    primary = _primary_model_value(entry.get("model"))
+                    if primary:
+                        return primary
+                    break
+        entries = agents.get("entries")
+        if isinstance(entries, dict) and isinstance(entries.get("main"), dict):
+            primary = _primary_model_value(entries["main"].get("model"))
+            if primary:
+                return primary
+        defaults = agents.get("defaults")
+        return _primary_model_value(defaults.get("model")) if isinstance(defaults, dict) else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+_SENSITIVE_CONFIG_KEY_RE = re.compile(
+    r"(?:api[_-]?key|token|secret|password|credential|authorization|cookie)",
+    re.IGNORECASE,
+)
+_MODEL_GUARD_SENTINEL = "<easel-main-model-target>"
+_CONFIG_GUARD_HMAC_KEY = os.urandom(32)
+_SECRET_REF_ID_KEYS = frozenset({"id", "key", "name", "path", "ref"})
+
+
+@dataclass(frozen=True)
+class _SecretValueGuard:
+    """Comparable process-local secret proof with a deliberately safe repr."""
+
+    kind: str
+    presence: str
+    provenance: str
+    _proof: bytes = field(repr=False)
+
+
+def _looks_like_secret_ref(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and "source" in value
+        and bool(_SECRET_REF_ID_KEYS.intersection(str(key).lower() for key in value))
+    )
+
+
+def _secret_value_guard(value: object) -> _SecretValueGuard:
+    """Fingerprint secret material without retaining or rendering its plaintext."""
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    proof = hmac.new(_CONFIG_GUARD_HMAC_KEY, serialized, hashlib.sha256).digest()
+    if isinstance(value, dict):
+        presence = "present" if value else "empty"
+        provenance = "declared" if "source" in value else "unspecified"
+        kind = "object"
+    elif isinstance(value, str):
+        presence = "present" if value else "empty"
+        provenance = "inline"
+        kind = "string"
+    else:
+        presence = "present" if value is not None else "empty"
+        provenance = "inline"
+        kind = type(value).__name__
+    return _SecretValueGuard(kind, presence, provenance, proof)
+
+
+def _guard_config_value(value: object, *, key: str = "") -> object:
+    if _SENSITIVE_CONFIG_KEY_RE.search(key) or _looks_like_secret_ref(value):
+        return _secret_value_guard(value)
+    if isinstance(value, dict):
+        return tuple(
+            (str(child_key), _guard_config_value(child, key=str(child_key)))
+            for child_key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, list):
+        return tuple(_guard_config_value(child, key=key) for child in value)
+    return value
+
+
+def _canonical_config_for_main_model_guard(data: dict[str, object]) -> dict[str, object]:
+    """Normalize legacy agent-list shape and mask the sole owned model leaf."""
+    canonical = json.loads(json.dumps(data))
+    agents = canonical.get("agents")
+    if not isinstance(agents, dict):
+        return canonical
+    listed = agents.get("list")
+    entries = agents.get("entries")
+    if isinstance(listed, list) and not isinstance(entries, dict):
+        entries: dict[str, object] = {}
+        for entry in listed:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("id"), str)
+                or entry["id"] in entries
+            ):
+                entries = {}
+                break
+            agent_id = entry["id"]
+            entries[agent_id] = {
+                key: value for key, value in entry.items() if key != "id"
+            }
+        if entries or not listed:
+            agents["entries"] = entries
+            agents.pop("list", None)
+    listed = agents.get("list")
+    entries = agents.get("entries")
+    main = None
+    if isinstance(listed, list):
+        main = next(
+            (
+                entry
+                for entry in listed
+                if isinstance(entry, dict) and entry.get("id") == "main"
+            ),
+            None,
+        )
+    if main is None:
+        main = entries.get("main") if isinstance(entries, dict) else None
+    if isinstance(main, dict):
+        model_value = main.get("model")
+        if isinstance(model_value, str):
+            main["model"] = _MODEL_GUARD_SENTINEL
+        elif isinstance(model_value, dict) and isinstance(model_value.get("primary"), str):
+            model_value["primary"] = _MODEL_GUARD_SENTINEL
+    return canonical
+
+
+def _main_agent_model_config_snapshot() -> MainModelConfigSnapshot | None:
+    """Read a secret-free CAS checkpoint for an explicit Main Agent model."""
+    try:
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        return None
+    main: dict[str, object] | None = None
+    listed = agents.get("list")
+    if isinstance(listed, list):
+        main = next(
+            (
+                entry
+                for entry in listed
+                if isinstance(entry, dict) and entry.get("id") == "main"
+            ),
+            None,
+        )
+    if main is None:
+        entries = agents.get("entries")
+        candidate = entries.get("main") if isinstance(entries, dict) else None
+        main = candidate if isinstance(candidate, dict) else None
+    if main is None:
+        return None
+    model_value = main.get("model")
+    if isinstance(model_value, str) and model_value.strip():
+        path = "agents.entries.main.model"
+        value = model_value.strip()
+    elif (
+        isinstance(model_value, dict)
+        and isinstance(model_value.get("primary"), str)
+        and model_value["primary"].strip()
+    ):
+        path = "agents.entries.main.model.primary"
+        value = model_value["primary"].strip()
+    else:
+        return None
+    canonical = _canonical_config_for_main_model_guard(data)
+    return MainModelConfigSnapshot(
+        path=path,
+        value=value,
+        semantic_guard=_guard_config_value(canonical),
+    )
+
+
+def _unpin_model(model: str) -> str:
+    slash = model.find("/")
+    profile = model.find("@", slash + 1) if slash >= 0 else -1
+    return model[:profile] if profile > slash else model
+
+
+def _text_model_argv(preflight: dict[str, object]) -> list[str]:
+    model = preflight.get("runtimeModel")
+    if not isinstance(model, str) or not _RUNTIME_MODEL_REF_RE.fullmatch(model):
+        return []
+    return ["--model", model]
+
+
+def _text_model_headers(preflight: dict[str, object]) -> dict[str, str]:
+    # OpenClaw 2026.9.7 validates x-openclaw-model before stripping an auth
+    # profile suffix, so an exact allowlist can reject the pinned ref.  Never
+    # remove the pin merely to make the Gateway request admissible: pinned
+    # plan turns use the CLI path below instead.
+    if preflight.get("authProfilePinned") is not False:
+        return {}
+    argv = _text_model_argv(preflight)
+    return {"x-openclaw-model": argv[1]} if argv else {}
+
+
+def _text_gateway_eligible(preflight: dict[str, object]) -> bool:
+    return preflight.get("authProfilePinned") is False and bool(
+        _text_model_headers(preflight)
+    )
+
+
+def _prepare_openai_text_inference() -> dict[str, object]:
+    model = _effective_main_agent_text_model()
+    if not model:
+        return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
+    base_model = _unpin_model(model)
+    if not base_model.startswith("openai/"):
+        result = {
+            "ok": True,
+            "billingRoute": "other",
+            "errorCode": "",
+            "runtimeModel": model,
+            "authProfilePinned": False,
+        }
+    else:
+        result = OPENAI_PLAN_AUTH.prepare_text_inference(model)
+    if result.get("ok") and not _text_model_argv(result):
+        return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
+    return result
+
+
+def _text_policy_error(error_code: str) -> str:
+    safe = {
+        "plan_auth_missing": "❌ ChatGPT Plan 尚未连接，未发送请求。",
+        "plan_reauth_required": "❌ ChatGPT Plan 需要重新登录，未发送请求。",
+        "plan_runtime_unavailable": "❌ ChatGPT Plan 本机运行时暂不可用，未切换到 Platform API。",
+        "local_runtime_unavailable": "❌ 无法确认 OpenClaw 本机运行状态，未发送请求。",
+        "billing_ambiguity": "❌ 无法确认本轮计费来源，已安全阻止。",
+        "platform_fallback_disabled": "❌ ChatGPT Plan 不可用且 Platform fallback 已关闭，未产生 API 计费。",
+        "runtime_policy_unavailable": "❌ 无法应用 OpenClaw 文本认证策略，已安全阻止。",
+        "model_route_unavailable": "❌ 无法确认 Main Agent 文本模型，已安全阻止。",
+        "plan_activation_required": "❌ Main Agent 尚未持久化绑定所选 ChatGPT Plan，已安全阻止。",
+    }
+    return safe.get(error_code, "❌ 无法安全确认本轮认证与计费来源，已阻止请求。")
 
 
 def check_gateway() -> bool:
@@ -1614,6 +1894,10 @@ class OpenAIPlanTestUseRequest(BaseModel):
     model: str
 
 
+class OpenAIPlanFallbackRequest(BaseModel):
+    enabled: bool
+
+
 @app.get("/api/settings/openai-plan/status")
 async def api_openai_plan_status():
     """Return the allowlisted OpenClaw-managed OpenAI plan status."""
@@ -1664,6 +1948,40 @@ async def api_openai_plan_test_use(req: OpenAIPlanTestUseRequest):
         )
     except OpenAIPlanInvalidRequest:
         raise HTTPException(400, "Profile 或模型已失效，请刷新后重试") from None
+
+
+@app.post("/api/settings/openai-plan/platform-fallback")
+async def api_openai_plan_platform_fallback(req: OpenAIPlanFallbackRequest):
+    """Explicitly apply the OpenClaw text auth order, then persist the opt-in."""
+    previous = _platform_fallback_enabled()
+    try:
+        result = await asyncio.to_thread(
+            OPENAI_PLAN_AUTH.set_platform_fallback,
+            req.enabled,
+        )
+    except OpenAIPlanInvalidRequest as exc:
+        safe_code = str(exc)
+        safe_detail = {
+            "plan_auth_required": "请先连接 ChatGPT Plan。",
+            "platform_credential_required": "未检测到可用于 fallback 的 Platform credential。",
+            "auth_status_unavailable": "暂时无法读取 OpenClaw 登录状态。",
+            "runtime_policy_unavailable": "OpenClaw 暂时无法应用文本路由策略。",
+        }.get(safe_code, "无法更新 Platform fallback 设置。")
+        raise HTTPException(409, safe_detail) from None
+    try:
+        _write_env_direct({OPENAI_PLATFORM_FALLBACK_ENV: "1" if req.enabled else "0"})
+    except OSError:
+        # Keep the persisted preference and the official auth order aligned.
+        # The rollback uses the same bounded, secret-free façade operation.
+        try:
+            await asyncio.to_thread(
+                OPENAI_PLAN_AUTH.set_platform_fallback,
+                previous,
+            )
+        except OpenAIPlanInvalidRequest:
+            pass
+        raise HTTPException(500, "无法持久化 Platform fallback；已尝试恢复原策略。") from None
+    return result
 
 
 @app.post("/api/settings/models/save")
@@ -2518,6 +2836,21 @@ async def api_chat_stream(req: ChatRequest):
         # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
         to_client("activity", "⏳ 已收到，正在唤醒 agent…")
 
+        preflight = await asyncio.to_thread(_prepare_openai_text_inference)
+        if not preflight.get("ok"):
+            safe_error = _text_policy_error(str(preflight.get("errorCode") or ""))
+            _save_turn(pk, "done", safe_error, {
+                "turn_id": turn_id,
+                "clean_end": False,
+                "stop_reason": "auth_policy_blocked",
+            })
+            to_client("error", safe_error)
+            to_client("done", sessionKey=sk)
+            client_q.put_nowait(CLIENT_DONE)
+            return
+        if preflight.get("billingRoute") == "platform_fallback":
+            to_client("activity", "⚠️ 已明确启用 Platform fallback，本轮可能产生 OpenAI API 费用。")
+
         async def _run_gateway_turn(hproc):
             """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。
 
@@ -2534,7 +2867,8 @@ async def api_chat_stream(req: ChatRequest):
             # 的话网关会自己另起一个 transcript —— 跨天空闲后丢历史，且万一本轮回退 CLI，
             # 两条路径会写进不同的会话文件，对话历史直接劈叉。
             headers = {"x-openclaw-session-key": f"agent:main:{sk}",
-                       "x-openclaw-session-id": _openclaw_session_id(sk)}
+                       "x-openclaw-session-id": _openclaw_session_id(sk),
+                       **_text_model_headers(preflight)}
             tool_noted = False
             saw_done = False
             got_text = False
@@ -2609,6 +2943,7 @@ async def api_chat_stream(req: ChatRequest):
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
             "--session-key", f"agent:main:{sk}", "--session-id", _openclaw_session_id(sk),
+            *_text_model_argv(preflight),
             "--thinking", THINKING_LEVEL,
             "--timeout", str(TIMEOUT_CHAT), "--message", message,
         ]
@@ -2643,7 +2978,10 @@ async def api_chat_stream(req: ChatRequest):
 
         # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
         # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
-        is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+        is_http = (
+            (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+            and _text_gateway_eligible(preflight)
+        )
         if is_http:
             # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
             proc = _GatewayHttpProc()

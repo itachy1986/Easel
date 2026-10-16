@@ -5,6 +5,7 @@ import {
   fetchOpenAIPlanJob,
   fetchOpenAIPlanModels,
   fetchOpenAIPlanStatus,
+  setOpenAIPlanPlatformFallback,
   testAndUseOpenAIPlan,
 } from '../lib/api';
 import type { OpenAIPlanCatalog, OpenAIPlanJob, OpenAIPlanStatus } from '../lib/api';
@@ -30,6 +31,14 @@ interface StoredJob {
 
 const ERROR_COPY: Record<string, string> = {
   platform_fallback_present: '存在 Platform 计费来源，已安全阻止。',
+  platform_fallback_disabled: 'Platform fallback 已关闭，未发送可能产生 API 费用的请求。',
+  platform_fallback_enabled: 'Platform fallback 已启用；Test & use 仅在 Plan-only 时开放。',
+  platform_fallback_selected: '本轮已选择 Platform fallback，可能产生 OpenAI API 费用。',
+  plan_auth_missing: '尚未连接 ChatGPT Plan。',
+  plan_reauth_required: 'ChatGPT Plan 需要重新登录。',
+  plan_runtime_unavailable: 'ChatGPT Plan 本机运行时暂不可用。',
+  local_runtime_unavailable: 'OpenClaw 本机运行时暂不可用。',
+  runtime_policy_unavailable: '无法应用 OpenClaw 文本认证策略。',
   billing_ambiguity: '无法确认唯一订阅计费来源，请刷新并检查 OpenClaw。',
   profile_unusable: 'ChatGPT Plan 登录暂不可用，需要重新登录。',
   profile_activation_failed: '无法启用当前登录配置，请刷新后重试。',
@@ -37,6 +46,8 @@ const ERROR_COPY: Record<string, string> = {
   model_test_unproven: '无法证明指定模型成功调用，未更改当前模型。',
   credential_proof_mismatch: '认证来源不匹配，已安全阻止。',
   catalog_empty: '当前账号未返回可用模型。',
+  plan_entitlement_unavailable: '当前 ChatGPT Plan 未返回可用订阅模型。',
+  plan_model_unavailable: '所选模型当前不在 ChatGPT Plan 可用目录中。',
   catalog_stale: '模型目录已过期，请刷新。',
   catalog_unavailable: '模型目录暂不可用，请稍后重试。',
   auth_failed: '登录失败，请重试。',
@@ -99,6 +110,8 @@ export function isExclusivePlanUsable(status: OpenAIPlanStatus | null): boolean 
     status?.connected
     && status.usable
     && status.billingSource === 'chatgpt_plan'
+    && status.effectiveTextBillingRoute === 'chatgpt_plan'
+    && !status.platformFallbackEnabled
     && status.activeProfileHandle,
   );
 }
@@ -114,6 +127,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [fallbackUpdating, setFallbackUpdating] = useState(false);
   const [message, setMessage] = useState('');
   const [messageKind, setMessageKind] = useState<PlanMessageKind>('warn');
   const [copyNote, setCopyNote] = useState('');
@@ -317,6 +331,26 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     }
   }, [refreshStatus, selectedModel, status]);
 
+  const updatePlatformFallback = useCallback(async (enabled: boolean) => {
+    setFallbackUpdating(true);
+    setMessage('');
+    try {
+      await setOpenAIPlanPlatformFallback(enabled);
+      if (!mountedRef.current) return;
+      setMessageKind(enabled ? 'warn' : 'ok');
+      setMessage(enabled
+        ? 'Platform fallback 已启用；Plan 不可用时可能产生 OpenAI Platform API 费用。'
+        : 'Platform fallback 已关闭；文本推理恢复为 Plan-only。');
+      await refreshStatus();
+    } catch {
+      if (!mountedRef.current) return;
+      setMessageKind('error');
+      setMessage('无法更新 Platform fallback；原设置保持不变。');
+    } finally {
+      if (mountedRef.current) setFallbackUpdating(false);
+    }
+  }, [refreshStatus]);
+
   const openAIModels = useMemo(
     () => (catalog?.models || []).filter(
       (model) => model.provider === 'openai' && model.ref.startsWith('openai/'),
@@ -356,6 +390,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     loading,
     catalogLoading,
     testing,
+    fallbackUpdating,
     message,
     messageKind,
     copyNote,
@@ -367,6 +402,7 @@ export function useChatGPTPlan(onSummaryChange?: (summary: ChatGPTPlanSummary) =
     cancelJob,
     refreshCatalog,
     testAndUse,
+    updatePlatformFallback,
     copyDeviceCommand,
     copyInteractiveCommand,
   };

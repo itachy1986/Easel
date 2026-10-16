@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -39,6 +41,23 @@ class FakeFacade:
         self.calls.append(("test", profile_handle, model))
         return {"ok": True, "selectedModel": model, "effectiveProvider": "openai", "testResult": "success", "errorCode": ""}
 
+    def set_platform_fallback(self, enabled):
+        self.calls.append(("fallback", enabled))
+        return {"ok": True, "platformFallbackEnabled": enabled}
+
+    def prepare_text_inference(self, model=None):
+        self.calls.append(("text-preflight", model))
+        return {
+            "ok": True,
+            "billingRoute": "chatgpt_plan",
+            "errorCode": "",
+            "runtimeModel": (
+                model if isinstance(model, str) and "@" in model
+                else f"{model}@openai:work" if model else ""
+            ),
+            "authProfilePinned": True,
+        }
+
     def shutdown(self):
         self.calls.append(("shutdown",))
 
@@ -59,7 +78,454 @@ def test_openai_plan_routes_are_thin_and_safe(monkeypatch):
         )
         assert response.status_code == 200
         assert response.json()["selectedModel"] == "openai/gpt-6-astra"
+        fallback = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+        assert fallback.status_code == 200
+        assert fallback.json()["platformFallbackEnabled"] is True
+    assert ("fallback", True) in fake.calls
     assert ("shutdown",) in fake.calls
+
+
+def test_platform_fallback_setting_persists_only_after_official_policy_succeeds(tmp_path, monkeypatch):
+    fake = FakeFacade()
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=value\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 200
+    assert ("fallback", True) in fake.calls
+    assert "EASEL_OPENAI_PLATFORM_FALLBACK=1" in env_file.read_text(encoding="utf-8")
+    assert "KEEP=value" in env_file.read_text(encoding="utf-8")
+
+
+def test_platform_fallback_setting_is_not_persisted_when_policy_apply_fails(tmp_path, monkeypatch):
+    from easel.openai_plan_auth import InvalidRequestError
+
+    class Reject(FakeFacade):
+        def set_platform_fallback(self, enabled):
+            raise InvalidRequestError("runtime_policy_unavailable")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=value\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", Reject())
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 409
+    assert env_file.read_text(encoding="utf-8") == "KEEP=value\n"
+
+
+def test_platform_fallback_setting_rolls_back_policy_when_env_write_fails(tmp_path, monkeypatch):
+    fake = FakeFacade()
+    env_file = tmp_path / ".env"
+    env_file.write_text("EASEL_OPENAI_PLATFORM_FALLBACK=0\n", encoding="utf-8")
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "ENV_FILE", env_file)
+    monkeypatch.setattr(web, "_write_env_direct", lambda _updates: (_ for _ in ()).throw(OSError()))
+    local = "http://127.0.0.1:7860"
+
+    with TestClient(web.app, base_url=local, client=("127.0.0.1", 51234), headers={"Origin": local}) as client:
+        response = client.post(
+            "/api/settings/openai-plan/platform-fallback",
+            json={"enabled": True},
+        )
+
+    assert response.status_code == 500
+    assert fake.calls[:2] == [("fallback", True), ("fallback", False)]
+    assert env_file.read_text(encoding="utf-8") == "EASEL_OPENAI_PLATFORM_FALLBACK=0\n"
+
+
+def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unchanged(
+    tmp_path, monkeypatch
+):
+    fake = FakeFacade()
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "OPENAI_PLAN_AUTH", fake)
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": {"primary": "anthropic/claude"}},
+                "list": [{"id": "main", "model": {"primary": "openai/gpt-6-astra@openai:work"}}],
+            }
+        }),
+        encoding="utf-8",
+    )
+    main_preflight = web._prepare_openai_text_inference()
+    assert main_preflight["billingRoute"] == "chatgpt_plan"
+    assert main_preflight["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    assert web._text_gateway_eligible(main_preflight) is False
+    assert ("text-preflight", "openai/gpt-6-astra@openai:work") in fake.calls
+
+    fake.calls.clear()
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": {"primary": "openai/gpt-6-astra"}},
+                "list": [{"id": "main", "model": "anthropic/claude"}],
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._prepare_openai_text_inference() == {
+        "ok": True,
+        "billingRoute": "other",
+        "errorCode": "",
+        "runtimeModel": "anthropic/claude",
+        "authProfilePinned": False,
+    }
+    assert fake.calls == []
+
+
+def test_text_runtime_pin_overrides_existing_session_model_for_cli_only():
+    preflight = {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    }
+
+    assert web._text_model_argv(preflight) == [
+        "--model", "openai/gpt-6-astra@openai:work",
+    ]
+    assert web._text_model_headers(preflight) == {}
+    assert web._text_gateway_eligible(preflight) is False
+
+
+def test_plan_activation_required_blocks_before_cli_spawn(monkeypatch):
+    monkeypatch.setattr(web, "_prepare_openai_text_inference", lambda: {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    })
+    monkeypatch.setattr(
+        web.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("agent must not start")
+        ),
+    )
+
+    result = web.run_agent_sync("hello", timeout=30, session_id="safe-session")
+
+    assert "尚未持久化绑定" in result
+
+
+def test_effective_main_model_precedence_covers_list_entries_and_defaults(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": "openai/default@openai:default"},
+                "entries": {
+                    "main": {"model": {"primary": "openai/entry@openai:entry"}}
+                },
+                "list": [
+                    {"id": "main", "model": "openai/list@openai:list"}
+                ],
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/list@openai:list"
+
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": "openai/default@openai:default"},
+                "entries": {
+                    "main": {"model": {"primary": "openai/entry@openai:entry"}}
+                },
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/entry@openai:entry"
+
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {
+                    "model": {"primary": "openai/default@openai:default"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/default@openai:default"
+
+
+def test_main_model_snapshot_masks_only_target_and_sensitive_values(tmp_path, monkeypatch):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "entries": {
+                "main": {
+                    "model": {"primary": "openai/old", "fallbacks": ["openai/fallback"]},
+                },
+                "media": {"model": "anthropic/media"},
+            },
+        },
+        "models": {
+            "providers": {
+                "openai": {"apiKey": "PLATFORM_KEY_SENTINEL", "baseUrl": "https://api.openai.com/v1"},
+            },
+        },
+        "media": {"image": {"provider": "openai", "profile": "media-profile"}},
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+
+    before = web._main_agent_model_config_snapshot()
+    assert before.path == "agents.entries.main.model.primary"
+    assert before.value == "openai/old"
+    assert "PLATFORM_KEY_SENTINEL" not in repr(before.semantic_guard)
+
+    baseline["agents"]["entries"]["main"]["model"]["primary"] = (
+        "openai/gpt-6-astra@openai:work"
+    )
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    intended = web._main_agent_model_config_snapshot()
+    assert intended.semantic_guard == before.semantic_guard
+
+    baseline["media"]["image"]["profile"] = "changed-media-profile"
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    assert web._main_agent_model_config_snapshot().semantic_guard != before.semantic_guard
+
+
+def test_main_model_guard_detects_same_shape_credential_changes_without_leaks(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "entries": {
+                "main": {"model": {"primary": "openai/old"}},
+                "media": {"model": "anthropic/media"},
+            },
+        },
+        "models": {
+            "providers": {
+                "openai": {
+                    "apiKey": "credential-alpha",
+                    "credential": {
+                        "source": "env",
+                        "id": "credential-ref-alpha",
+                        "nested": {"token": "nested-alpha"},
+                    },
+                    "headers": {"Authorization": "Bearer header-alpha"},
+                },
+            },
+        },
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    original = web._main_agent_model_config_snapshot()
+    assert original is not None
+
+    mutations = []
+    api_key = deepcopy(baseline)
+    api_key["models"]["providers"]["openai"]["apiKey"] = "credential-beta"
+    mutations.append(api_key)
+
+    secret_ref = deepcopy(baseline)
+    secret_ref["models"]["providers"]["openai"]["credential"]["id"] = (
+        "credential-ref-beta"
+    )
+    mutations.append(secret_ref)
+
+    secret_source = deepcopy(baseline)
+    secret_source["models"]["providers"]["openai"]["credential"]["source"] = (
+        "file"
+    )
+    mutations.append(secret_source)
+
+    authorization = deepcopy(baseline)
+    authorization["models"]["providers"]["openai"]["headers"]["Authorization"] = (
+        "Bearer header-beta"
+    )
+    mutations.append(authorization)
+
+    nested_secret = deepcopy(baseline)
+    nested_secret["models"]["providers"]["openai"]["credential"]["nested"][
+        "token"
+    ] = "nested-beta"
+    mutations.append(nested_secret)
+
+    for mutated in mutations:
+        config.write_text(json.dumps(mutated), encoding="utf-8")
+        observed = web._main_agent_model_config_snapshot()
+        assert observed is not None
+        assert observed.semantic_guard != original.semantic_guard
+
+    guard_repr = repr(original.semantic_guard)
+    for secret in (
+        "credential-alpha",
+        "credential-ref-alpha",
+        "nested-alpha",
+        "header-alpha",
+    ):
+        assert secret not in guard_repr
+    assert "fingerprint" not in guard_repr.lower()
+    assert "digest" not in guard_repr.lower()
+
+
+def test_main_model_guard_preserves_auxiliary_entries_during_legacy_normalization(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "list": [
+                {
+                    "id": "main",
+                    "model": {"primary": "openai/old"},
+                    "workspace": "main-workspace",
+                },
+                {"id": "media", "model": "anthropic/media"},
+            ],
+            "entries": {
+                "auxiliary": {
+                    "model": "anthropic/auxiliary",
+                    "workspace": "auxiliary-workspace-a",
+                }
+            },
+        }
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    original = web._main_agent_model_config_snapshot()
+    assert original is not None
+
+    intended = deepcopy(baseline)
+    intended["agents"]["list"][0]["model"]["primary"] = (
+        "openai/gpt-6-astra@openai:work"
+    )
+    config.write_text(json.dumps(intended), encoding="utf-8")
+    model_only = web._main_agent_model_config_snapshot()
+    assert model_only is not None
+    assert model_only.semantic_guard == original.semantic_guard
+
+    drifted = deepcopy(intended)
+    drifted["agents"]["entries"]["auxiliary"]["workspace"] = (
+        "auxiliary-workspace-b"
+    )
+    config.write_text(json.dumps(drifted), encoding="utf-8")
+    auxiliary_change = web._main_agent_model_config_snapshot()
+    assert auxiliary_change is not None
+    assert auxiliary_change.semantic_guard != original.semantic_guard
+
+
+def test_main_model_snapshot_requires_explicit_main_override(tmp_path, monkeypatch):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": "openai/inherited"}}}),
+        encoding="utf-8",
+    )
+
+    assert web._main_agent_model_config_snapshot() is None
+
+
+def test_unpinned_explicit_fallback_route_remains_gateway_eligible():
+    preflight = {
+        "ok": True,
+        "billingRoute": "platform_fallback",
+        "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
+    }
+
+    assert web._text_model_headers(preflight) == {
+        "x-openclaw-model": "openai/gpt-6-astra",
+    }
+    assert web._text_gateway_eligible(preflight) is True
+
+
+def test_missing_pin_proof_is_not_gateway_eligible():
+    preflight = {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra",
+    }
+
+    assert web._text_model_headers(preflight) == {}
+    assert web._text_gateway_eligible(preflight) is False
+
+
+def test_invalid_main_agent_model_fails_closed_instead_of_reusing_session_override(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": "anthropic/claude\ninvalid"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+
+    assert web._prepare_openai_text_inference() == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "model_route_unavailable",
+    }
+
+
+def test_cli_chat_run_passes_exact_runtime_model_as_argv(monkeypatch):
+    captured = {}
+
+    class FakeLock:
+        def __init__(self, _key):
+            pass
+
+        def acquire(self, timeout):
+            return timeout > 0
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(web, "_prepare_openai_text_inference", lambda: {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra@openai:work",
+        "authProfilePinned": True,
+    })
+    monkeypatch.setattr(web, "_heal_openclaw_session", lambda _key: None)
+    monkeypatch.setattr(web, "_openclaw_session_id", lambda _key: "session-id")
+    monkeypatch.setattr(web, "_CrossProcLock", FakeLock)
+    monkeypatch.setattr(web, "_proxy_env", lambda: {})
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(stdout="OK")
+
+    monkeypatch.setattr(web.subprocess, "run", fake_run)
+
+    assert web.run_agent_sync("hello", timeout=30, session_id="safe-session") == "OK"
+    command = captured["cmd"]
+    assert command[command.index("--model") + 1] == "openai/gpt-6-astra@openai:work"
 
 
 def test_test_use_rejects_unknown_handle_as_400_without_echo(monkeypatch):
@@ -130,3 +596,21 @@ def test_frontend_maps_gateway_job_phases_and_safe_failure_codes():
     assert "正在等待 OpenClaw 完成登录" in card
     assert "openclaw --profile easel models auth login --provider openai --method siwc" in hook
     assert "terminalCommand" in hook
+
+
+def test_frontend_exposes_explicit_platform_fallback_without_weakening_plan_test_gate():
+    hook = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "useChatGPTPlan.ts").read_text(
+        encoding="utf-8"
+    )
+    card = (PROJECT_ROOT / "web" / "frontend" / "src" / "components" / "ChatGPTPlanCard.tsx").read_text(
+        encoding="utf-8"
+    )
+    api = (PROJECT_ROOT / "web" / "frontend" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+
+    assert "platformFallbackEnabled" in api
+    assert "platformCredentialPresent" in api
+    assert "effectiveTextBillingRoute" in api
+    assert "/api/settings/openai-plan/platform-fallback" in api
+    assert "!status.platformFallbackEnabled" in hook
+    assert "允许 Platform API 文本 fallback" in card
+    assert "可能产生 OpenAI Platform API 费用" in card

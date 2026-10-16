@@ -265,8 +265,19 @@ def test_setup_sh_has_no_bare_placeholder_comparisons():
 # ── doctor：.env 填了 ≠ openclaw 真写了 ────────────────────────────────
 
 
-def _routable(tmp_path, cfg: dict | None, monkeypatch) -> tuple[bool, str]:
+def _routable(tmp_path, cfg: dict | None, monkeypatch, plan_status: dict | None = None) -> tuple[bool, str]:
     monkeypatch.setenv("EASEL_OPENCLAW_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        doctor,
+        "_openai_plan_status",
+        lambda: plan_status or {
+            "available": True,
+            "planConnected": False,
+            "planReauthRequired": False,
+            "planRuntimeStatus": "missing",
+            "platformCredentialPresent": False,
+        },
+    )
     if cfg is not None:
         (tmp_path / "openclaw.json").write_text(json.dumps(cfg), encoding="utf-8")
     return doctor._primary_model_routable()
@@ -289,6 +300,62 @@ def test_doctor_catches_provider_without_key(tmp_path, monkeypatch):
         tmp_path, _cfg("openai/gpt-4o", {"openai": {"baseUrl": "https://x/v1", "apiKey": ""}}),
         monkeypatch)
     assert not ok and "没有 apiKey" in detail
+
+
+def test_doctor_accepts_canonical_openai_oauth_without_provider_api_key(tmp_path, monkeypatch):
+    status = {
+            "available": True,
+            "planConnected": True,
+            "planReauthRequired": False,
+            "planRuntimeStatus": "usable",
+            "platformCredentialPresent": False,
+        }
+
+    ok, detail = _routable(tmp_path, _cfg("openai/gpt-6-astra", {}), monkeypatch, status)
+
+    assert ok is True
+    assert "ChatGPT Plan" in detail
+
+
+def test_doctor_distinguishes_openai_oauth_runtime_unavailable_from_invalid_auth(tmp_path, monkeypatch):
+    status = {
+            "available": False,
+            "planConnected": True,
+            "planReauthRequired": False,
+            "planRuntimeStatus": "unavailable",
+            "platformCredentialPresent": False,
+        }
+
+    ok, detail = _routable(tmp_path, _cfg("openai/gpt-6-astra", {}), monkeypatch, status)
+
+    assert ok is False
+    assert "运行时暂不可用" in detail
+    assert "重新登录" not in detail
+
+
+@pytest.mark.parametrize(
+    ("fallback_enabled", "expected_ok", "expected_copy"),
+    [
+        (False, False, "fallback 当前关闭"),
+        (True, True, "fallback 已明确启用"),
+    ],
+)
+def test_doctor_reports_platform_credential_separately_from_fallback_policy(
+    tmp_path, monkeypatch, fallback_enabled, expected_ok, expected_copy
+):
+    status = {
+        "available": True,
+        "planConnected": False,
+        "planReauthRequired": False,
+        "planRuntimeStatus": "usable",
+        "platformCredentialPresent": True,
+        "platformFallbackEnabled": fallback_enabled,
+    }
+
+    ok, detail = _routable(tmp_path, _cfg("openai/gpt-6-astra", {}), monkeypatch, status)
+
+    assert ok is expected_ok
+    assert expected_copy in detail
 
 
 def test_doctor_catches_missing_primary(tmp_path, monkeypatch):

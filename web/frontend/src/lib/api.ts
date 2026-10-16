@@ -901,6 +901,12 @@ export interface OpenAIPlanStatus {
   displayLabel: string;
   selectedModel: string;
   runtimeStatus: string;
+  planConnected: boolean;
+  planReauthRequired: boolean;
+  planRuntimeStatus: string;
+  platformCredentialPresent: boolean;
+  platformFallbackEnabled: boolean;
+  effectiveTextBillingRoute: 'chatgpt_plan' | 'platform_fallback' | 'platform_api' | 'blocked' | 'unknown';
   errorCode: string;
   recoveryAction: string;
   deviceCodeWebSupported: boolean;
@@ -971,5 +977,13 @@ export function testAndUseOpenAIPlan(profileHandle: string, model: string): Prom
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ profileHandle, model }),
+  });
+}
+
+export function setOpenAIPlanPlatformFallback(enabled: boolean): Promise<{ ok: boolean; platformFallbackEnabled: boolean }> {
+  return request('/api/settings/openai-plan/platform-fallback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
   });
 }
