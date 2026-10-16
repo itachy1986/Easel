@@ -73,9 +73,10 @@ def test_real_openclaw_config_cas_changes_only_main_text_model(tmp_path):
             "OPENCLAW_SKIP_CHANNELS": "1",
         }
     )
-    # The executable check isolates the config engine's CAS/write scope. The
-    # companion 2026.9.7 source harness and facade tests cover the auth-profile
-    # suffix because a real pinned value correctly requires a stored profile.
+    # The executable check isolates the config engine's CAS/write scope. A
+    # model@profile target is rejected unless the isolated canonical auth store
+    # contains that profile, so the no-credential runtime fixture stays bare;
+    # source and facade tests separately cover the persisted profile suffix.
     target = "openai/gpt-6-astra"
     command = [
         *base,

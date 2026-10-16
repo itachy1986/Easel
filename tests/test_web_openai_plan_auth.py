@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import sys
 from types import SimpleNamespace
@@ -311,6 +312,129 @@ def test_main_model_snapshot_masks_only_target_and_sensitive_values(tmp_path, mo
     baseline["media"]["image"]["profile"] = "changed-media-profile"
     config.write_text(json.dumps(baseline), encoding="utf-8")
     assert web._main_agent_model_config_snapshot().semantic_guard != before.semantic_guard
+
+
+def test_main_model_guard_detects_same_shape_credential_changes_without_leaks(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "entries": {
+                "main": {"model": {"primary": "openai/old"}},
+                "media": {"model": "anthropic/media"},
+            },
+        },
+        "models": {
+            "providers": {
+                "openai": {
+                    "apiKey": "credential-alpha",
+                    "credential": {
+                        "source": "env",
+                        "id": "credential-ref-alpha",
+                        "nested": {"token": "nested-alpha"},
+                    },
+                    "headers": {"Authorization": "Bearer header-alpha"},
+                },
+            },
+        },
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    original = web._main_agent_model_config_snapshot()
+    assert original is not None
+
+    mutations = []
+    api_key = deepcopy(baseline)
+    api_key["models"]["providers"]["openai"]["apiKey"] = "credential-beta"
+    mutations.append(api_key)
+
+    secret_ref = deepcopy(baseline)
+    secret_ref["models"]["providers"]["openai"]["credential"]["id"] = (
+        "credential-ref-beta"
+    )
+    mutations.append(secret_ref)
+
+    secret_source = deepcopy(baseline)
+    secret_source["models"]["providers"]["openai"]["credential"]["source"] = (
+        "file"
+    )
+    mutations.append(secret_source)
+
+    authorization = deepcopy(baseline)
+    authorization["models"]["providers"]["openai"]["headers"]["Authorization"] = (
+        "Bearer header-beta"
+    )
+    mutations.append(authorization)
+
+    nested_secret = deepcopy(baseline)
+    nested_secret["models"]["providers"]["openai"]["credential"]["nested"][
+        "token"
+    ] = "nested-beta"
+    mutations.append(nested_secret)
+
+    for mutated in mutations:
+        config.write_text(json.dumps(mutated), encoding="utf-8")
+        observed = web._main_agent_model_config_snapshot()
+        assert observed is not None
+        assert observed.semantic_guard != original.semantic_guard
+
+    guard_repr = repr(original.semantic_guard)
+    for secret in (
+        "credential-alpha",
+        "credential-ref-alpha",
+        "nested-alpha",
+        "header-alpha",
+    ):
+        assert secret not in guard_repr
+    assert "fingerprint" not in guard_repr.lower()
+    assert "digest" not in guard_repr.lower()
+
+
+def test_main_model_guard_preserves_auxiliary_entries_during_legacy_normalization(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "list": [
+                {
+                    "id": "main",
+                    "model": {"primary": "openai/old"},
+                    "workspace": "main-workspace",
+                },
+                {"id": "media", "model": "anthropic/media"},
+            ],
+            "entries": {
+                "auxiliary": {
+                    "model": "anthropic/auxiliary",
+                    "workspace": "auxiliary-workspace-a",
+                }
+            },
+        }
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    original = web._main_agent_model_config_snapshot()
+    assert original is not None
+
+    intended = deepcopy(baseline)
+    intended["agents"]["list"][0]["model"]["primary"] = (
+        "openai/gpt-6-astra@openai:work"
+    )
+    config.write_text(json.dumps(intended), encoding="utf-8")
+    model_only = web._main_agent_model_config_snapshot()
+    assert model_only is not None
+    assert model_only.semantic_guard == original.semantic_guard
+
+    drifted = deepcopy(intended)
+    drifted["agents"]["entries"]["auxiliary"]["workspace"] = (
+        "auxiliary-workspace-b"
+    )
+    config.write_text(json.dumps(drifted), encoding="utf-8")
+    auxiliary_change = web._main_agent_model_config_snapshot()
+    assert auxiliary_change is not None
+    assert auxiliary_change.semantic_guard != original.semantic_guard
 
 
 def test_main_model_snapshot_requires_explicit_main_override(tmp_path, monkeypatch):

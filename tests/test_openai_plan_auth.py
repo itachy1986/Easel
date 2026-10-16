@@ -2066,22 +2066,24 @@ def test_failed_one_shot_restores_only_owned_model_pin_with_cas():
     ]
 
 
-def test_non_target_config_change_fails_closed_and_rolls_back_owned_pin():
+def test_non_target_config_change_fails_closed_without_exposing_guard(capsys):
+    baseline_guard = ("credential-proof-alpha",)
+    changed_guard = ("credential-proof-beta",)
     states = iter([
         MainModelConfigSnapshot(
             "agents.entries.main.model.primary",
             "openai/gpt-old",
-            ("baseline",),
+            baseline_guard,
         ),
         MainModelConfigSnapshot(
             "agents.entries.main.model.primary",
             "openai/gpt-6-astra@openai:work",
-            ("concurrent-change",),
+            changed_guard,
         ),
         MainModelConfigSnapshot(
             "agents.entries.main.model.primary",
             "openai/gpt-old",
-            ("concurrent-change",),
+            changed_guard,
         ),
     ])
     runner = QueueRunner(
@@ -2099,6 +2101,10 @@ def test_non_target_config_change_fails_closed_and_rolls_back_owned_pin():
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
 
     assert body["errorCode"] == "config_concurrent_update"
+    assert "credential-proof" not in json.dumps(body)
+    captured = capsys.readouterr()
+    assert "credential-proof" not in captured.out
+    assert "credential-proof" not in captured.err
     assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
 
 

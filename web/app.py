@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+import hmac
 import os
 if os.name == "nt":
     import msvcrt
@@ -942,25 +944,55 @@ _SENSITIVE_CONFIG_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _MODEL_GUARD_SENTINEL = "<easel-main-model-target>"
+_CONFIG_GUARD_HMAC_KEY = os.urandom(32)
+_SECRET_REF_ID_KEYS = frozenset({"id", "key", "name", "path", "ref"})
 
 
-def _secret_value_shape(value: object) -> tuple[object, ...]:
-    """Keep presence/source semantics without retaining credential material."""
+@dataclass(frozen=True)
+class _SecretValueGuard:
+    """Comparable process-local secret proof with a deliberately safe repr."""
+
+    kind: str
+    presence: str
+    provenance: str
+    _proof: bytes = field(repr=False)
+
+
+def _looks_like_secret_ref(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and "source" in value
+        and bool(_SECRET_REF_ID_KEYS.intersection(str(key).lower() for key in value))
+    )
+
+
+def _secret_value_guard(value: object) -> _SecretValueGuard:
+    """Fingerprint secret material without retaining or rendering its plaintext."""
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    proof = hmac.new(_CONFIG_GUARD_HMAC_KEY, serialized, hashlib.sha256).digest()
     if isinstance(value, dict):
-        source = value.get("source")
-        return (
-            "secret-object",
-            source if isinstance(source, str) else "unspecified",
-            tuple(sorted(str(key) for key in value)),
-        )
-    if isinstance(value, str):
-        return ("secret-string", "present" if value else "empty")
-    return ("secret-value", type(value).__name__)
+        presence = "present" if value else "empty"
+        provenance = "declared" if "source" in value else "unspecified"
+        kind = "object"
+    elif isinstance(value, str):
+        presence = "present" if value else "empty"
+        provenance = "inline"
+        kind = "string"
+    else:
+        presence = "present" if value is not None else "empty"
+        provenance = "inline"
+        kind = type(value).__name__
+    return _SecretValueGuard(kind, presence, provenance, proof)
 
 
 def _guard_config_value(value: object, *, key: str = "") -> object:
-    if _SENSITIVE_CONFIG_KEY_RE.search(key):
-        return _secret_value_shape(value)
+    if _SENSITIVE_CONFIG_KEY_RE.search(key) or _looks_like_secret_ref(value):
+        return _secret_value_guard(value)
     if isinstance(value, dict):
         return tuple(
             (str(child_key), _guard_config_value(child, key=str(child_key)))
@@ -978,19 +1010,38 @@ def _canonical_config_for_main_model_guard(data: dict[str, object]) -> dict[str,
     if not isinstance(agents, dict):
         return canonical
     listed = agents.get("list")
-    if isinstance(listed, list):
+    entries = agents.get("entries")
+    if isinstance(listed, list) and not isinstance(entries, dict):
         entries: dict[str, object] = {}
         for entry in listed:
-            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
-                continue
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("id"), str)
+                or entry["id"] in entries
+            ):
+                entries = {}
+                break
             agent_id = entry["id"]
             entries[agent_id] = {
                 key: value for key, value in entry.items() if key != "id"
             }
-        agents["entries"] = entries
-        agents.pop("list", None)
+        if entries or not listed:
+            agents["entries"] = entries
+            agents.pop("list", None)
+    listed = agents.get("list")
     entries = agents.get("entries")
-    main = entries.get("main") if isinstance(entries, dict) else None
+    main = None
+    if isinstance(listed, list):
+        main = next(
+            (
+                entry
+                for entry in listed
+                if isinstance(entry, dict) and entry.get("id") == "main"
+            ),
+            None,
+        )
+    if main is None:
+        main = entries.get("main") if isinstance(entries, dict) else None
     if isinstance(main, dict):
         model_value = main.get("model")
         if isinstance(model_value, str):
