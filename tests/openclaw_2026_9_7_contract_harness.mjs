@@ -105,9 +105,21 @@ assert.doesNotMatch(agentExecSource, /credentialSource/);
 const agentCommandSource = await readFile(await one("agent-command-", "function resolveEmbeddedModelSelection"), "utf8");
 assert.match(
   agentCommandSource,
+  /configuredDefaultAuthProfileId = splitTrailingAuthProfile\(resolveNativeModelPrimary\(params\.cfg, params\.sessionAgentId\) \?\? ""\)\.profile/,
+);
+assert.match(
+  agentCommandSource,
   /providerOverride === defaultProvider && modelOverride === defaultModel \? configuredDefaultAuthProfileId/,
 );
 assert.match(agentCommandSource, /configuredAuthProfileId,/);
+assert.match(
+  agentCommandSource,
+  /hasExplicitRunOverride = Boolean\(explicitProviderOverride \|\| explicitModelOverride\)/,
+);
+assert.match(
+  agentCommandSource,
+  /modelOverrideSource: hasExplicitRunOverride \? "user" : storedModelOverrideSource/,
+);
 
 const attemptSource = await readFile(await one("attempt-execution.runtime-", "function runAgentAttempt"), "utf8");
 assert.match(
@@ -147,5 +159,7 @@ process.stdout.write(JSON.stringify({
   exactAllowlistRejectsPinnedHeader: true,
   unrestrictedAcceptsPinnedHeader: true,
   explicitModelDisablesConfiguredFallbacks: true,
+  persistedMainModelSuppliesCredentialPin: true,
+  explicitModelOverridesSessionSelection: true,
   agentExecEnvelopeHasCredentialIdentity: false,
 }));

@@ -184,6 +184,10 @@ class QueueRunner:
 
 
 def facade(runner, **kwargs):
+    kwargs.setdefault(
+        "main_model_reader",
+        lambda: "openai/gpt-6-astra@openai:work",
+    )
     return OpenAIPlanAuthFacade(
         profile="easel",
         base_cmd_factory=lambda: ["node.exe", r"C:\npm\openclaw.mjs"],
@@ -193,8 +197,8 @@ def facade(runner, **kwargs):
     )
 
 
-def mapped_facade(runner):
-    auth = facade(runner)
+def mapped_facade(runner, **kwargs):
+    auth = facade(runner, **kwargs)
     body = auth.status()
     return auth, body["profiles"][0]["handle"]
 
@@ -531,18 +535,38 @@ def test_text_preflight_applies_plan_only_order_before_openai_inference():
     assert "openai:api-key" not in policy_call
 
 
-def test_provider_config_key_off_returns_exact_plan_pin_after_fresh_policy_read():
+def test_provider_config_key_off_blocks_unpinned_main_model_without_running_agent():
     provider_key_status = status_with_provider_key()
     runner = QueueRunner(
         result(PLAN),
         result(provider_key_status),
-        result({"order": []}),
-        ProcessResult(0, "updated", "", "completed"),
-        result(PLAN),
-        result(provider_key_status),
     )
 
-    body = facade(runner).prepare_text_inference("openai/gpt-6-astra")
+    body = facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    ).prepare_text_inference("openai/gpt-6-astra")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    }
+    assert not any("agent" in call for call, *_ in runner.calls)
+    assert "PROVIDER_KEY_SENTINEL" not in json.dumps(body)
+
+
+def test_provider_config_key_off_accepts_only_exact_persisted_plan_pin():
+    provider_key_status = status_with_provider_key()
+    runner = QueueRunner(
+        result(PLAN),
+        result(provider_key_status),
+        result({"order": ["openai:work"]}),
+    )
+
+    body = facade(runner).prepare_text_inference(
+        "openai/gpt-6-astra@openai:work"
+    )
 
     assert body == {
         "ok": True,
@@ -551,14 +575,54 @@ def test_provider_config_key_off_returns_exact_plan_pin_after_fresh_policy_read(
         "runtimeModel": "openai/gpt-6-astra@openai:work",
         "authProfilePinned": True,
     }
-    policy_call = runner.calls[3][0]
-    assert policy_call[-1] == "openai:work"
-    assert not any(
-        part in {"config", "delete", "unset", "paste-api-key"}
-        for call, *_ in runner.calls
-        for part in call
+
+
+@pytest.mark.parametrize(
+    ("persisted", "requested"),
+    [
+        ("openai/gpt-6-astra@openai:other", "openai/gpt-6-astra@openai:other"),
+        ("openai/gpt-other@openai:work", "openai/gpt-6-astra@openai:work"),
+        ("openai/gpt-6-astra@", "openai/gpt-6-astra@"),
+    ],
+)
+def test_plan_only_preflight_rejects_wrong_or_invalid_persisted_pin(
+    persisted, requested
+):
+    runner = QueueRunner(result(PLAN), result(STATUS))
+
+    body = facade(
+        runner,
+        main_model_reader=lambda: persisted,
+    ).prepare_text_inference(requested)
+
+    assert body["ok"] is False
+    assert body["billingRoute"] == "blocked"
+    assert body["errorCode"] in {"plan_activation_required", "model_route_unavailable"}
+    assert not any("agent" in call for call, *_ in runner.calls)
+
+
+def test_plan_only_preflight_blocks_if_persisted_pin_changes_during_policy_reconcile():
+    persisted = iter([
+        "openai/gpt-6-astra@openai:work",
+        "openai/gpt-6-astra@openai:other",
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result({"order": []}),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
     )
-    assert "PROVIDER_KEY_SENTINEL" not in json.dumps(body)
+
+    body = facade(
+        runner,
+        main_model_reader=lambda: next(persisted),
+    ).prepare_text_inference("openai/gpt-6-astra@openai:work")
+
+    assert body == {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    }
 
 
 def test_post_policy_fresh_auth_read_uses_bounded_cold_start_retry():
@@ -575,7 +639,7 @@ def test_post_policy_fresh_auth_read_uses_bounded_cold_start_retry():
         runner,
         command_timeout=30,
         cold_start_retry_timeout=45,
-    ).prepare_text_inference("openai/gpt-6-astra")
+    ).prepare_text_inference("openai/gpt-6-astra@openai:work")
 
     assert body["ok"] is True
     assert body["authProfilePinned"] is True
@@ -591,7 +655,7 @@ def test_provider_config_key_off_blocks_when_plan_runtime_is_unavailable():
         result(PLAN), result(unavailable),
     )
 
-    body = facade(runner).prepare_text_inference("openai/gpt-6-astra")
+    body = facade(runner).prepare_text_inference("openai/gpt-6-astra@openai:work")
 
     assert body == {
         "ok": False,
@@ -611,6 +675,7 @@ def test_provider_config_key_is_allowed_only_after_explicit_fallback_opt_in():
     body = facade(
         runner,
         platform_fallback_enabled=True,
+        main_model_reader=lambda: "openai/gpt-6-astra",
     ).prepare_text_inference("openai/gpt-6-astra")
 
     assert body == {
@@ -634,6 +699,7 @@ def test_fallback_policy_does_not_claim_platform_from_credential_presence_alone(
     body = facade(
         runner,
         platform_fallback_enabled=True,
+        main_model_reader=lambda: "openai/gpt-6-astra",
     ).prepare_text_inference("openai/gpt-6-astra")
 
     assert body == {
@@ -1761,6 +1827,25 @@ def test_activation_must_confirm_requested_profile_before_inference():
     assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
 
 
+def test_activation_exit_zero_without_exact_persisted_pin_never_runs_inference():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "activated", "", "completed"),
+        result(PLAN), result(STATUS),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-6-astra",
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["ok"] is False
+    assert body["errorCode"] == "profile_activation_unconfirmed"
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
 def test_agent_exec_stable_envelope_needs_no_invented_profile_field():
     turn = {"ok": True, "provider": "openai", "model": "gpt-6-astra"}
     runner = QueueRunner(
@@ -1787,6 +1872,7 @@ def test_activation_model_must_match_requested_model_before_agent_exec():
         result(PLAN), result(activated_other),
     )
     auth, handle = mapped_facade(runner)
+    auth._main_model_reader = lambda: "openai/gpt-other@openai:work"
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body == {
         "ok": False,
@@ -1891,7 +1977,12 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
         result(SENSITIVE_PLAN), result(status), result(turn),
         result(SENSITIVE_PLAN), result(status),
     )
-    auth, handle = mapped_facade(runner)
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: (
+            "openai/gpt-6-astra@openai:user@example.com"
+        ),
+    )
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is True
     assert SENSITIVE_PROFILE_ID not in json.dumps(body)

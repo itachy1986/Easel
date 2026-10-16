@@ -90,6 +90,7 @@ OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
     profile=OPENCLAW_PROFILE,
     cwd=PROJECT_ROOT,
     platform_fallback_enabled=lambda: _platform_fallback_enabled(),
+    main_model_reader=lambda: _effective_main_agent_text_model(),
 )
 # 对话传输层：http＝直连常驻 gateway 的 OpenAI 兼容端点，agent 在 gateway 进程里直接跑，
 # 省掉每轮 spawn `openclaw agent` 瘦客户端的冷启动（本机实测同一句话：CLI 7.1-7.6s/轮，
@@ -978,7 +979,7 @@ def _prepare_openai_text_inference() -> dict[str, object]:
             "authProfilePinned": False,
         }
     else:
-        result = OPENAI_PLAN_AUTH.prepare_text_inference(base_model)
+        result = OPENAI_PLAN_AUTH.prepare_text_inference(model)
     if result.get("ok") and not _text_model_argv(result):
         return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
     return result
@@ -994,6 +995,7 @@ def _text_policy_error(error_code: str) -> str:
         "platform_fallback_disabled": "❌ ChatGPT Plan 不可用且 Platform fallback 已关闭，未产生 API 计费。",
         "runtime_policy_unavailable": "❌ 无法应用 OpenClaw 文本认证策略，已安全阻止。",
         "model_route_unavailable": "❌ 无法确认 Main Agent 文本模型，已安全阻止。",
+        "plan_activation_required": "❌ Main Agent 尚未持久化绑定所选 ChatGPT Plan，已安全阻止。",
     }
     return safe.get(error_code, "❌ 无法安全确认本轮认证与计费来源，已阻止请求。")
 

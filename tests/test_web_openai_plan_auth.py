@@ -50,7 +50,10 @@ class FakeFacade:
             "ok": True,
             "billingRoute": "chatgpt_plan",
             "errorCode": "",
-            "runtimeModel": f"{model}@openai:work" if model else "",
+            "runtimeModel": (
+                model if isinstance(model, str) and "@" in model
+                else f"{model}@openai:work" if model else ""
+            ),
             "authProfilePinned": True,
         }
 
@@ -159,7 +162,7 @@ def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unc
         json.dumps({
             "agents": {
                 "defaults": {"model": {"primary": "anthropic/claude"}},
-                "list": [{"id": "main", "model": {"primary": "openai/gpt-6-astra"}}],
+                "list": [{"id": "main", "model": {"primary": "openai/gpt-6-astra@openai:work"}}],
             }
         }),
         encoding="utf-8",
@@ -168,7 +171,7 @@ def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unc
     assert main_preflight["billingRoute"] == "chatgpt_plan"
     assert main_preflight["runtimeModel"] == "openai/gpt-6-astra@openai:work"
     assert web._text_gateway_eligible(main_preflight) is False
-    assert ("text-preflight", "openai/gpt-6-astra") in fake.calls
+    assert ("text-preflight", "openai/gpt-6-astra@openai:work") in fake.calls
 
     fake.calls.clear()
     config.write_text(
@@ -204,6 +207,72 @@ def test_text_runtime_pin_overrides_existing_session_model_for_cli_only():
     ]
     assert web._text_model_headers(preflight) == {}
     assert web._text_gateway_eligible(preflight) is False
+
+
+def test_plan_activation_required_blocks_before_cli_spawn(monkeypatch):
+    monkeypatch.setattr(web, "_prepare_openai_text_inference", lambda: {
+        "ok": False,
+        "billingRoute": "blocked",
+        "errorCode": "plan_activation_required",
+    })
+    monkeypatch.setattr(
+        web.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("agent must not start")
+        ),
+    )
+
+    result = web.run_agent_sync("hello", timeout=30, session_id="safe-session")
+
+    assert "尚未持久化绑定" in result
+
+
+def test_effective_main_model_precedence_covers_list_entries_and_defaults(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": "openai/default@openai:default"},
+                "entries": {
+                    "main": {"model": {"primary": "openai/entry@openai:entry"}}
+                },
+                "list": [
+                    {"id": "main", "model": "openai/list@openai:list"}
+                ],
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/list@openai:list"
+
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {"model": "openai/default@openai:default"},
+                "entries": {
+                    "main": {"model": {"primary": "openai/entry@openai:entry"}}
+                },
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/entry@openai:entry"
+
+    config.write_text(
+        json.dumps({
+            "agents": {
+                "defaults": {
+                    "model": {"primary": "openai/default@openai:default"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert web._effective_main_agent_text_model() == "openai/default@openai:default"
 
 
 def test_unpinned_explicit_fallback_route_remains_gateway_eligible():

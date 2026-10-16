@@ -42,6 +42,22 @@ _MANUAL_LOGIN_COMMANDS = {
 }
 
 
+def _split_persisted_model_ref(value: object) -> tuple[str, str]:
+    """Return a validated OpenAI model and its optional persisted auth pin."""
+    if not isinstance(value, str):
+        return "", ""
+    candidate = value.strip()
+    slash = candidate.find("/")
+    marker = candidate.find("@", slash + 1) if slash >= 0 else -1
+    model = candidate[:marker] if marker > slash else candidate
+    profile_id = candidate[marker + 1:] if marker > slash else ""
+    if not _MODEL_REF_RE.fullmatch(model):
+        return "", ""
+    if marker > slash and not _PROFILE_ID_RE.fullmatch(profile_id):
+        return "", ""
+    return model, profile_id
+
+
 class InvalidRequestError(ValueError):
     """A client value is outside the safe contract."""
 
@@ -560,6 +576,7 @@ class OpenAIPlanAuthFacade:
         interactive_runner: Any | None = None,
         platform_name: str | None = None,
         platform_fallback_enabled: Callable[[], bool] | bool = False,
+        main_model_reader: Callable[[], str] | None = None,
     ):
         self.profile = profile
         self._base_cmd_factory = base_cmd_factory
@@ -586,6 +603,7 @@ class OpenAIPlanAuthFacade:
         )
         self._platform_name = platform_name or os.name
         self._platform_fallback_enabled = platform_fallback_enabled
+        self._main_model_reader = main_model_reader or (lambda: "")
         if gateway_readiness is not None:
             self._gateway_readiness = gateway_readiness
         elif self._platform_name == "nt":
@@ -641,6 +659,13 @@ class OpenAIPlanAuthFacade:
         except Exception:  # noqa: BLE001 - policy read failures must fail closed
             return False
         return value is True
+
+    def _effective_main_model(self) -> str:
+        try:
+            value = self._main_model_reader()
+        except Exception:  # noqa: BLE001 - config reads must fail closed
+            return ""
+        return value.strip() if isinstance(value, str) else ""
 
     @staticmethod
     def _profile_order(auth_payload: Any, *, include_platform: bool) -> list[str]:
@@ -747,6 +772,23 @@ class OpenAIPlanAuthFacade:
 
     def prepare_text_inference(self, model: str | None = None) -> dict[str, Any]:
         """Reconcile policy and return the exact model ref for one text run."""
+        persisted_model = self._effective_main_model()
+        if model is not None and model != persisted_model:
+            return {
+                "ok": False,
+                "billingRoute": "blocked",
+                "errorCode": "plan_activation_required",
+            }
+        requested_model, requested_profile_id = _split_persisted_model_ref(
+            persisted_model
+        )
+        if not requested_model:
+            return {
+                "ok": False,
+                "billingRoute": "blocked",
+                "errorCode": "model_route_unavailable",
+            }
+
         plans, auth_payload, auth_error = self._current_plan_profiles()
         if auth_error:
             return {"ok": False, "billingRoute": "blocked", "errorCode": "local_runtime_unavailable"}
@@ -759,10 +801,6 @@ class OpenAIPlanAuthFacade:
         if assessment.error_code:
             return {"ok": False, "billingRoute": "blocked", "errorCode": assessment.error_code}
 
-        runtime_model = model or assessment.selected_model
-        if not isinstance(runtime_model, str) or not _MODEL_REF_RE.fullmatch(runtime_model):
-            return {"ok": False, "billingRoute": "blocked", "errorCode": "model_route_unavailable"}
-
         fallback_enabled = self._fallback_enabled()
         if not plans:
             error_code = (
@@ -773,6 +811,21 @@ class OpenAIPlanAuthFacade:
             return {"ok": False, "billingRoute": "blocked", "errorCode": error_code}
         if all(bool(row["reauth_required"]) for row in plans):
             return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_reauth_required"}
+        if (
+            not fallback_enabled
+            and (
+                not requested_profile_id
+                or (
+                    assessment.active_profile_id
+                    and requested_profile_id != assessment.active_profile_id
+                )
+            )
+        ):
+            return {
+                "ok": False,
+                "billingRoute": "blocked",
+                "errorCode": "plan_activation_required",
+            }
 
         policy_error, policy_changed = self._ensure_text_auth_order(
             auth_payload,
@@ -796,6 +849,24 @@ class OpenAIPlanAuthFacade:
         if not fresh_plans:
             return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_auth_missing"}
 
+        # Re-read the effective main-agent route after policy reconciliation.
+        # A CLI --model suffix is not a credential pin in OpenClaw 2026.9.7;
+        # only this persisted route can supply configuredDefaultAuthProfileId.
+        fresh_persisted_model = self._effective_main_model()
+        fresh_model, fresh_profile_id = _split_persisted_model_ref(
+            fresh_persisted_model
+        )
+        if (
+            not fresh_model
+            or fresh_model != requested_model
+            or fresh_persisted_model != persisted_model
+        ):
+            return {
+                "ok": False,
+                "billingRoute": "blocked",
+                "errorCode": "plan_activation_required",
+            }
+
         if (
             fresh_assessment.effective_text_billing_route == "chatgpt_plan"
             and fresh_assessment.runtime_status == "usable"
@@ -805,17 +876,21 @@ class OpenAIPlanAuthFacade:
                     "ok": True,
                     "billingRoute": "chatgpt_plan",
                     "errorCode": "",
-                    "runtimeModel": runtime_model,
+                    "runtimeModel": requested_model,
                     "authProfilePinned": False,
                 }
             profile_id = fresh_assessment.exclusive_plan_profile_id
-            if not profile_id:
-                return {"ok": False, "billingRoute": "blocked", "errorCode": "billing_ambiguity"}
+            if not profile_id or fresh_profile_id != profile_id:
+                return {
+                    "ok": False,
+                    "billingRoute": "blocked",
+                    "errorCode": "plan_activation_required",
+                }
             return {
                 "ok": True,
                 "billingRoute": "chatgpt_plan",
                 "errorCode": "",
-                "runtimeModel": f"{runtime_model}@{profile_id}",
+                "runtimeModel": fresh_persisted_model,
                 "authProfilePinned": True,
             }
         if (
@@ -827,7 +902,7 @@ class OpenAIPlanAuthFacade:
                 "ok": True,
                 "billingRoute": "platform_fallback",
                 "errorCode": "platform_fallback_selected",
-                "runtimeModel": runtime_model,
+                "runtimeModel": requested_model,
                 "authProfilePinned": False,
             }
         return {"ok": False, "billingRoute": "blocked", "errorCode": "plan_runtime_unavailable"}
@@ -1356,8 +1431,13 @@ class OpenAIPlanAuthFacade:
         # stable agent-exec JSON envelope (which intentionally exposes no
         # credential identity).  A different activated model would cause the
         # explicit override to lose configuredAuthProfileId, so fail closed.
-        if activated_assessment.selected_model != model:
+        activated_model, activated_profile_id = _split_persisted_model_ref(
+            self._effective_main_model()
+        )
+        if activated_model != model:
             return self._test_failure("profile_model_mismatch")
+        if activated_profile_id != profile_id:
+            return self._test_failure("profile_activation_unconfirmed")
 
         # Use an empty one-shot workspace so this proof cannot include Easel's
         # repository, user files, or chat history in model context.
@@ -1385,6 +1465,11 @@ class OpenAIPlanAuthFacade:
         proof_error = self._credential_proof_error(final_assessment, profile_id)
         if proof_error:
             return self._test_failure(proof_error)
+        final_model, final_profile_id = _split_persisted_model_ref(
+            self._effective_main_model()
+        )
+        if final_model != model or final_profile_id != profile_id:
+            return self._test_failure("profile_activation_unconfirmed")
 
         return {
             "ok": True,
