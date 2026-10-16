@@ -275,6 +275,55 @@ def test_effective_main_model_precedence_covers_list_entries_and_defaults(
     assert web._effective_main_agent_text_model() == "openai/default@openai:default"
 
 
+def test_main_model_snapshot_masks_only_target_and_sensitive_values(tmp_path, monkeypatch):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    baseline = {
+        "agents": {
+            "entries": {
+                "main": {
+                    "model": {"primary": "openai/old", "fallbacks": ["openai/fallback"]},
+                },
+                "media": {"model": "anthropic/media"},
+            },
+        },
+        "models": {
+            "providers": {
+                "openai": {"apiKey": "PLATFORM_KEY_SENTINEL", "baseUrl": "https://api.openai.com/v1"},
+            },
+        },
+        "media": {"image": {"provider": "openai", "profile": "media-profile"}},
+    }
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+
+    before = web._main_agent_model_config_snapshot()
+    assert before.path == "agents.entries.main.model.primary"
+    assert before.value == "openai/old"
+    assert "PLATFORM_KEY_SENTINEL" not in repr(before.semantic_guard)
+
+    baseline["agents"]["entries"]["main"]["model"]["primary"] = (
+        "openai/gpt-6-astra@openai:work"
+    )
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    intended = web._main_agent_model_config_snapshot()
+    assert intended.semantic_guard == before.semantic_guard
+
+    baseline["media"]["image"]["profile"] = "changed-media-profile"
+    config.write_text(json.dumps(baseline), encoding="utf-8")
+    assert web._main_agent_model_config_snapshot().semantic_guard != before.semantic_guard
+
+
+def test_main_model_snapshot_requires_explicit_main_override(tmp_path, monkeypatch):
+    config = tmp_path / "openclaw.json"
+    monkeypatch.setattr(web, "_oc_config_path", lambda: config)
+    config.write_text(
+        json.dumps({"agents": {"defaults": {"model": "openai/inherited"}}}),
+        encoding="utf-8",
+    )
+
+    assert web._main_agent_model_config_snapshot() is None
+
+
 def test_unpinned_explicit_fallback_route_remains_gateway_eligible():
     preflight = {
         "ok": True,

@@ -79,6 +79,15 @@ class ProcessResult:
 
 
 @dataclass(frozen=True)
+class MainModelConfigSnapshot:
+    """Secret-free proof for the one config leaf Test & use may mutate."""
+
+    path: str
+    value: str
+    semantic_guard: object
+
+
+@dataclass(frozen=True)
 class _CredentialAssessment:
     """Safe, secret-free evidence about OpenAI credential routing."""
 
@@ -577,6 +586,7 @@ class OpenAIPlanAuthFacade:
         platform_name: str | None = None,
         platform_fallback_enabled: Callable[[], bool] | bool = False,
         main_model_reader: Callable[[], str] | None = None,
+        main_model_snapshot_reader: Callable[[], MainModelConfigSnapshot] | None = None,
     ):
         self.profile = profile
         self._base_cmd_factory = base_cmd_factory
@@ -604,6 +614,7 @@ class OpenAIPlanAuthFacade:
         self._platform_name = platform_name or os.name
         self._platform_fallback_enabled = platform_fallback_enabled
         self._main_model_reader = main_model_reader or (lambda: "")
+        self._main_model_snapshot_reader = main_model_snapshot_reader
         if gateway_readiness is not None:
             self._gateway_readiness = gateway_readiness
         elif self._platform_name == "nt":
@@ -666,6 +677,68 @@ class OpenAIPlanAuthFacade:
         except Exception:  # noqa: BLE001 - config reads must fail closed
             return ""
         return value.strip() if isinstance(value, str) else ""
+
+    def _main_model_snapshot(self) -> MainModelConfigSnapshot | None:
+        if self._main_model_snapshot_reader is None:
+            return None
+        try:
+            snapshot = self._main_model_snapshot_reader()
+        except Exception:  # noqa: BLE001 - config reads must fail closed
+            return None
+        if not isinstance(snapshot, MainModelConfigSnapshot):
+            return None
+        if snapshot.path not in {
+            "agents.entries.main.model",
+            "agents.entries.main.model.primary",
+        }:
+            return None
+        if not isinstance(snapshot.value, str) or not snapshot.value.strip():
+            return None
+        if snapshot.semantic_guard is None:
+            return None
+        return MainModelConfigSnapshot(
+            path=snapshot.path,
+            value=snapshot.value.strip(),
+            semantic_guard=snapshot.semantic_guard,
+        )
+
+    def _set_main_model_cas(
+        self,
+        snapshot: MainModelConfigSnapshot,
+        value: str,
+    ) -> bool:
+        try:
+            result = self._run(
+                [
+                    "config", "set", snapshot.path, json.dumps(value),
+                    "--strict-json", "--expect-current-json",
+                    json.dumps(snapshot.value),
+                ]
+            )
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            return False
+        return result.outcome == "completed" and result.returncode == 0
+
+    @staticmethod
+    def _safe_auth_inventory(payload: Any) -> tuple[tuple[str, str, str], ...]:
+        """Compare profile identities without retaining credential material."""
+        rows = payload.get("profiles") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return ()
+        inventory: list[tuple[str, str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            profile_id = _safe_profile_id(row.get("id"))
+            provider = row.get("provider")
+            profile_type = row.get("type")
+            if (
+                profile_id
+                and isinstance(provider, str)
+                and isinstance(profile_type, str)
+            ):
+                inventory.append((profile_id, provider, profile_type))
+        return tuple(sorted(inventory))
 
     @staticmethod
     def _profile_order(auth_payload: Any, *, include_platform: bool) -> list[str]:
@@ -910,18 +983,34 @@ class OpenAIPlanAuthFacade:
     def _fresh_text_evidence(
         self,
     ) -> tuple[list[dict[str, str | bool]], _CredentialAssessment | None, str]:
+        plans, _auth_payload, assessment, error = self._fresh_text_evidence_full()
+        return plans, assessment, error
+
+    def _fresh_text_evidence_full(
+        self,
+    ) -> tuple[
+        list[dict[str, str | bool]],
+        Any | None,
+        _CredentialAssessment | None,
+        str,
+    ]:
         auth_payload, auth_error = self._run_json_readonly_with_cold_start_retry(
             ["models", "auth", "list", "--provider", "openai", "--json"]
         )
         plans = _plan_profiles(auth_payload)
         if auth_error:
-            return plans, None, auth_error
+            return plans, auth_payload, None, auth_error
         status_payload, status_error = self._run_json_readonly_with_cold_start_retry(
             ["models", "status", "--json"]
         )
         if status_error:
-            return plans, None, status_error
-        return plans, _credential_assessment(auth_payload, status_payload, plans), ""
+            return plans, auth_payload, None, status_error
+        return (
+            plans,
+            auth_payload,
+            _credential_assessment(auth_payload, status_payload, plans),
+            "",
+        )
 
     def _auth_payload(self) -> tuple[Any | None, str]:
         return self._run_json(["models", "auth", "list", "--provider", "openai", "--json"])
@@ -1409,20 +1498,84 @@ class OpenAIPlanAuthFacade:
         if model not in allowed:
             return self._test_failure("plan_model_unavailable")
 
-        activated = self._run(
-            ["models", "auth", "activate", profile_id, "--agent", "main"]
+        baseline = self._main_model_snapshot()
+        if baseline is None:
+            return self._test_failure("model_pin_unavailable")
+        current_model, _current_profile_id = _split_persisted_model_ref(
+            baseline.value
         )
-        if activated.outcome != "completed" or activated.returncode != 0:
-            return self._test_failure("profile_activation_failed")
+        if not current_model:
+            return self._test_failure("model_pin_unavailable")
+        pinned_model = f"{model}@{profile_id}"
+        changed_model = baseline.value != pinned_model
+        baseline_auth_inventory = self._safe_auth_inventory(auth_payload)
 
-        activated_plans, activated_assessment, activated_error = self._current_credential_assessment()
+        if not self._set_main_model_cas(baseline, pinned_model):
+            observed = self._main_model_snapshot()
+            if observed == baseline:
+                return self._test_failure("model_pin_conflict")
+            # A timeout or interrupted CLI can have committed before its
+            # outcome became observable.  Without proof of ownership, never
+            # infer success and never roll back a possibly concurrent write.
+            return self._test_failure("model_pin_outcome_unknown")
+
+        def fail_after_pin(error_code: str) -> dict[str, Any]:
+            if not changed_model:
+                return self._test_failure(error_code)
+            rollback_from = MainModelConfigSnapshot(
+                path=baseline.path,
+                value=pinned_model,
+                semantic_guard=baseline.semantic_guard,
+            )
+            if not self._set_main_model_cas(rollback_from, baseline.value):
+                observed = self._main_model_snapshot()
+                if (
+                    observed is not None
+                    and observed.path == baseline.path
+                    and observed.value == baseline.value
+                ):
+                    return self._test_failure(error_code)
+                return self._test_failure("model_pin_rollback_conflict")
+            restored = self._main_model_snapshot()
+            if (
+                restored is None
+                or restored.path != baseline.path
+                or restored.value != baseline.value
+            ):
+                return self._test_failure("model_pin_rollback_unconfirmed")
+            return self._test_failure(error_code)
+
+        activated_config = self._main_model_snapshot()
+        if (
+            activated_config is None
+            or activated_config.path != baseline.path
+        ):
+            return fail_after_pin("profile_activation_unconfirmed")
+        if activated_config.semantic_guard != baseline.semantic_guard:
+            return fail_after_pin("config_concurrent_update")
+        activated_model, activated_profile_id = _split_persisted_model_ref(
+            activated_config.value
+        )
+        if activated_model != model:
+            return fail_after_pin("profile_model_mismatch")
+        if activated_profile_id != profile_id:
+            return fail_after_pin("profile_activation_unconfirmed")
+
+        (
+            activated_plans,
+            activated_auth_payload,
+            activated_assessment,
+            activated_error,
+        ) = self._fresh_text_evidence_full()
         if activated_error or activated_assessment is None:
-            return self._test_failure("profile_activation_unconfirmed")
+            return fail_after_pin("profile_activation_unconfirmed")
+        if self._safe_auth_inventory(activated_auth_payload) != baseline_auth_inventory:
+            return fail_after_pin("auth_inventory_changed")
         if self._resolve_profile_handle(profile_handle, activated_plans) != profile_id:
-            return self._test_failure("profile_activation_unconfirmed")
+            return fail_after_pin("profile_activation_unconfirmed")
         proof_error = self._credential_proof_error(activated_assessment, profile_id)
         if proof_error:
-            return self._test_failure(
+            return fail_after_pin(
                 "profile_activation_unconfirmed" if proof_error == "billing_ambiguity" else proof_error
             )
         # OpenClaw 2026.9.7 strips the trailing @profile from an explicit
@@ -1431,14 +1584,6 @@ class OpenAIPlanAuthFacade:
         # stable agent-exec JSON envelope (which intentionally exposes no
         # credential identity).  A different activated model would cause the
         # explicit override to lose configuredAuthProfileId, so fail closed.
-        activated_model, activated_profile_id = _split_persisted_model_ref(
-            self._effective_main_model()
-        )
-        if activated_model != model:
-            return self._test_failure("profile_model_mismatch")
-        if activated_profile_id != profile_id:
-            return self._test_failure("profile_activation_unconfirmed")
-
         # Use an empty one-shot workspace so this proof cannot include Easel's
         # repository, user files, or chat history in model context.
         with self._workspace_factory() as test_workspace:
@@ -1455,21 +1600,29 @@ class OpenAIPlanAuthFacade:
                 timeout=self._test_timeout + 15,
             )
         if turn_error or not self._turn_proves_model(turn_payload, model):
-            return self._test_failure("model_test_unproven")
+            return fail_after_pin("model_test_unproven")
 
-        final_plans, final_assessment, final_error = self._current_credential_assessment()
+        (
+            final_plans,
+            final_auth_payload,
+            final_assessment,
+            final_error,
+        ) = self._fresh_text_evidence_full()
         if final_error or final_assessment is None:
-            return self._test_failure("billing_ambiguity")
+            return fail_after_pin("billing_ambiguity")
+        if self._safe_auth_inventory(final_auth_payload) != baseline_auth_inventory:
+            return fail_after_pin("auth_inventory_changed")
         if self._resolve_profile_handle(profile_handle, final_plans) != profile_id:
-            return self._test_failure("billing_ambiguity")
+            return fail_after_pin("billing_ambiguity")
         proof_error = self._credential_proof_error(final_assessment, profile_id)
         if proof_error:
-            return self._test_failure(proof_error)
-        final_model, final_profile_id = _split_persisted_model_ref(
-            self._effective_main_model()
-        )
+            return fail_after_pin(proof_error)
+        final_config = self._main_model_snapshot()
+        if final_config is None or final_config.semantic_guard != baseline.semantic_guard:
+            return fail_after_pin("config_concurrent_update")
+        final_model, final_profile_id = _split_persisted_model_ref(final_config.value)
         if final_model != model or final_profile_id != profile_id:
-            return self._test_failure("profile_activation_unconfirmed")
+            return fail_after_pin("profile_activation_unconfirmed")
 
         return {
             "ok": True,

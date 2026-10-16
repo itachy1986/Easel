@@ -40,4 +40,6 @@ def test_real_openclaw_2026_9_7_parser_route_and_projection_contract():
         "persistedMainModelSuppliesCredentialPin": True,
         "explicitModelOverridesSessionSelection": True,
         "agentExecEnvelopeHasCredentialIdentity": False,
+        "authActivateDeletesProviderApiKeyWhenProfileSelected": True,
+        "conditionalConfigSetUsesRevisionGuardedSinglePathMutation": True,
     }

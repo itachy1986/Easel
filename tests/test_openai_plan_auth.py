@@ -14,6 +14,7 @@ from easel.openai_plan_auth import (
     BoundedProcessRunner,
     InteractiveAuthProcessRunner,
     InvalidRequestError,
+    MainModelConfigSnapshot,
     OpenAIPlanAuthFacade,
     ProcessResult,
 )
@@ -184,9 +185,17 @@ class QueueRunner:
 
 
 def facade(runner, **kwargs):
-    kwargs.setdefault(
+    model_reader = kwargs.setdefault(
         "main_model_reader",
         lambda: "openai/gpt-6-astra@openai:work",
+    )
+    kwargs.setdefault(
+        "main_model_snapshot_reader",
+        lambda: MainModelConfigSnapshot(
+            path="agents.entries.main.model.primary",
+            value=model_reader(),
+            semantic_guard=("sanitized-config",),
+        ),
     )
     return OpenAIPlanAuthFacade(
         profile="easel",
@@ -1699,9 +1708,12 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
     assert calls[2][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
     assert calls[3][-3:] == ["models", "status", "--json"]
     assert calls[4][-5:] == ["models", "list", "--provider", "openai", "--json"]
-    assert calls[5][-6:] == [
-        "models", "auth", "activate", "openai:work", "--agent", "main",
+    assert calls[5][-7:] == [
+        "config", "set", "agents.entries.main.model.primary",
+        '"openai/gpt-6-astra@openai:work"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-6-astra@openai:work"',
     ]
+    assert not any(call[-4:-1] == ["models", "auth", "activate"] for call in calls)
     turn_call = calls[8]
     assert turn_call[4:6] == ["agent", "exec"]
     assert turn_call[turn_call.index("--cwd") + 1] == r"C:\empty-test-workspace"
@@ -1872,7 +1884,19 @@ def test_activation_model_must_match_requested_model_before_agent_exec():
         result(PLAN), result(activated_other),
     )
     auth, handle = mapped_facade(runner)
-    auth._main_model_reader = lambda: "openai/gpt-other@openai:work"
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-other@openai:work",
+            ("sanitized-config",),
+        ),
+    ])
+    auth._main_model_snapshot_reader = lambda: next(states)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body == {
         "ok": False,
@@ -1986,10 +2010,212 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is True
     assert SENSITIVE_PROFILE_ID not in json.dumps(body)
-    activate = next(call[0] for call in runner.calls if "activate" in call[0])
-    assert activate[-6:] == [
-        "models", "auth", "activate", SENSITIVE_PROFILE_ID, "--agent", "main",
+    mutation = next(call[0] for call in runner.calls if "config" in call[0] and "set" in call[0])
+    assert mutation[-7:] == [
+        "config", "set", "agents.entries.main.model.primary",
+        json.dumps(f"openai/gpt-6-astra@{SENSITIVE_PROFILE_ID}"), "--strict-json",
+        "--expect-current-json",
+        json.dumps(f"openai/gpt-6-astra@{SENSITIVE_PROFILE_ID}"),
     ]
+    assert not any("activate" in call[0] for call in runner.calls)
+
+
+def test_failed_one_shot_restores_only_owned_model_pin_with_cas():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("sanitized-config",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("sanitized-config",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
+        result({"ok": False, "provider": "openai", "model": "gpt-6-astra"}),
+        ProcessResult(0, "restored", "", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_test_unproven"
+    mutations = [call[0] for call in runner.calls if "config" in call[0] and "set" in call[0]]
+    assert mutations[0][-4:] == [
+        '"openai/gpt-6-astra@openai:work"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-old"',
+    ]
+    assert mutations[1][-4:] == [
+        '"openai/gpt-old"', "--strict-json",
+        "--expect-current-json", '"openai/gpt-6-astra@openai:work"',
+    ]
+
+
+def test_non_target_config_change_fails_closed_and_rolls_back_owned_pin():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("concurrent-change",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("concurrent-change",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        ProcessResult(0, "restored", "", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "config_concurrent_update"
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_stale_model_pin_cas_never_runs_inference_or_blanket_restore():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(1, "", "conditional expectation did not match", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_conflict"
+    mutations = [call[0] for call in runner.calls if "config" in call[0] and "set" in call[0]]
+    assert len(mutations) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_interrupted_model_pin_never_runs_inference_or_rollback():
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(-1, "", "", "timeout"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_conflict"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_interrupted_model_pin_with_changed_state_reports_unknown_without_rollback():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("baseline",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(-1, "", "", "timeout"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_outcome_unknown"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 1
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_failed_turn_reports_rollback_conflict_without_overwriting_concurrent_model():
+    states = iter([
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-old",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/gpt-6-astra@openai:work",
+            ("baseline",),
+        ),
+        MainModelConfigSnapshot(
+            "agents.entries.main.model.primary",
+            "openai/concurrent@openai:work",
+            ("concurrent",),
+        ),
+    ])
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "updated", "", "completed"),
+        result(PLAN), result(STATUS),
+        result({"ok": False, "provider": "openai", "model": "gpt-6-astra"}),
+        ProcessResult(1, "", "conditional expectation did not match", "completed"),
+    )
+    auth, handle = mapped_facade(
+        runner,
+        main_model_reader=lambda: "openai/gpt-old",
+        main_model_snapshot_reader=lambda: next(states),
+    )
+
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+
+    assert body["errorCode"] == "model_pin_rollback_conflict"
+    assert len([call for call in runner.calls if "config" in call[0]]) == 2
 
 
 def test_public_handle_is_bound_to_current_profile_snapshot():
@@ -2027,6 +2253,8 @@ def test_facade_only_uses_auth_order_for_explicit_text_policy():
     assert "paste-api-key" not in source
     assert '"auth", "order", "set"' in source
     assert '"auth", "order", "clear"' not in source
+    assert '"auth", "activate"' not in source
+    assert '"--expect-current-json"' in source
     assert "--force" not in source
     assert "--set-default" not in source
 

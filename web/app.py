@@ -45,6 +45,7 @@ from easel.openai_plan_auth import (
     ActiveJobError,
     InvalidRequestError as OpenAIPlanInvalidRequest,
     JobNotFoundError,
+    MainModelConfigSnapshot,
     OpenAIPlanAuthFacade,
 )
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
@@ -91,6 +92,7 @@ OPENAI_PLAN_AUTH = OpenAIPlanAuthFacade(
     cwd=PROJECT_ROOT,
     platform_fallback_enabled=lambda: _platform_fallback_enabled(),
     main_model_reader=lambda: _effective_main_agent_text_model(),
+    main_model_snapshot_reader=lambda: _main_agent_model_config_snapshot(),
 )
 # 对话传输层：http＝直连常驻 gateway 的 OpenAI 兼容端点，agent 在 gateway 进程里直接跑，
 # 省掉每轮 spawn `openclaw agent` 瘦客户端的冷启动（本机实测同一句话：CLI 7.1-7.6s/轮，
@@ -933,6 +935,118 @@ def _effective_main_agent_text_model() -> str:
         return _primary_model_value(defaults.get("model")) if isinstance(defaults, dict) else ""
     except (OSError, ValueError, TypeError):
         return ""
+
+
+_SENSITIVE_CONFIG_KEY_RE = re.compile(
+    r"(?:api[_-]?key|token|secret|password|credential|authorization|cookie)",
+    re.IGNORECASE,
+)
+_MODEL_GUARD_SENTINEL = "<easel-main-model-target>"
+
+
+def _secret_value_shape(value: object) -> tuple[object, ...]:
+    """Keep presence/source semantics without retaining credential material."""
+    if isinstance(value, dict):
+        source = value.get("source")
+        return (
+            "secret-object",
+            source if isinstance(source, str) else "unspecified",
+            tuple(sorted(str(key) for key in value)),
+        )
+    if isinstance(value, str):
+        return ("secret-string", "present" if value else "empty")
+    return ("secret-value", type(value).__name__)
+
+
+def _guard_config_value(value: object, *, key: str = "") -> object:
+    if _SENSITIVE_CONFIG_KEY_RE.search(key):
+        return _secret_value_shape(value)
+    if isinstance(value, dict):
+        return tuple(
+            (str(child_key), _guard_config_value(child, key=str(child_key)))
+            for child_key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, list):
+        return tuple(_guard_config_value(child, key=key) for child in value)
+    return value
+
+
+def _canonical_config_for_main_model_guard(data: dict[str, object]) -> dict[str, object]:
+    """Normalize legacy agent-list shape and mask the sole owned model leaf."""
+    canonical = json.loads(json.dumps(data))
+    agents = canonical.get("agents")
+    if not isinstance(agents, dict):
+        return canonical
+    listed = agents.get("list")
+    if isinstance(listed, list):
+        entries: dict[str, object] = {}
+        for entry in listed:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            agent_id = entry["id"]
+            entries[agent_id] = {
+                key: value for key, value in entry.items() if key != "id"
+            }
+        agents["entries"] = entries
+        agents.pop("list", None)
+    entries = agents.get("entries")
+    main = entries.get("main") if isinstance(entries, dict) else None
+    if isinstance(main, dict):
+        model_value = main.get("model")
+        if isinstance(model_value, str):
+            main["model"] = _MODEL_GUARD_SENTINEL
+        elif isinstance(model_value, dict) and isinstance(model_value.get("primary"), str):
+            model_value["primary"] = _MODEL_GUARD_SENTINEL
+    return canonical
+
+
+def _main_agent_model_config_snapshot() -> MainModelConfigSnapshot | None:
+    """Read a secret-free CAS checkpoint for an explicit Main Agent model."""
+    try:
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        return None
+    main: dict[str, object] | None = None
+    listed = agents.get("list")
+    if isinstance(listed, list):
+        main = next(
+            (
+                entry
+                for entry in listed
+                if isinstance(entry, dict) and entry.get("id") == "main"
+            ),
+            None,
+        )
+    if main is None:
+        entries = agents.get("entries")
+        candidate = entries.get("main") if isinstance(entries, dict) else None
+        main = candidate if isinstance(candidate, dict) else None
+    if main is None:
+        return None
+    model_value = main.get("model")
+    if isinstance(model_value, str) and model_value.strip():
+        path = "agents.entries.main.model"
+        value = model_value.strip()
+    elif (
+        isinstance(model_value, dict)
+        and isinstance(model_value.get("primary"), str)
+        and model_value["primary"].strip()
+    ):
+        path = "agents.entries.main.model.primary"
+        value = model_value["primary"].strip()
+    else:
+        return None
+    canonical = _canonical_config_for_main_model_guard(data)
+    return MainModelConfigSnapshot(
+        path=path,
+        value=value,
+        semantic_guard=_guard_config_value(canonical),
+    )
 
 
 def _unpin_model(model: str) -> str:

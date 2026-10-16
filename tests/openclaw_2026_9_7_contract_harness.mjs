@@ -147,6 +147,17 @@ assert.match(
   setupSelectionSource,
   /params\.authProfileId \? `\$\{key\}@\$\{params\.authProfileId\}` : key/,
 );
+assert.match(
+  setupSelectionSource,
+  /if \(params\.profileId\) delete selectedProvider\.apiKey/,
+);
+const configRunnerSource = await readFile(
+  await one("config-cli-runner-", "function assertConfigSetCurrentExpectation"),
+  "utf8",
+);
+assert.match(configRunnerSource, /conditional config set expectation did not match/);
+assert.match(configRunnerSource, /baseHash: snapshot\.hash/);
+assert.match(configRunnerSource, /setAtPath\(next, operation\.setPath, operation\.value/);
 
 const httpSource = await readFile(await one("http-utils-", "function resolveOpenAiCompatModelOverride"), "utf8");
 assert.match(httpSource, /const parsed = parseModelRef\(raw,/);
@@ -162,4 +173,6 @@ process.stdout.write(JSON.stringify({
   persistedMainModelSuppliesCredentialPin: true,
   explicitModelOverridesSessionSelection: true,
   agentExecEnvelopeHasCredentialIdentity: false,
+  authActivateDeletesProviderApiKeyWhenProfileSelected: true,
+  conditionalConfigSetUsesRevisionGuardedSinglePathMutation: true,
 }));
