@@ -1606,7 +1606,6 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
         "status": "ok",
         "provider": "openai",
         "model": "gpt-6-astra",
-        "authProfileId": "openai:work",
     }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
@@ -1617,7 +1616,6 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
         result(PLAN), result(STATUS),
         result(turn),
         result(PLAN), result(STATUS),
-        ProcessResult(0, "set", "", "completed"),
     )
     auth, handle = mapped_facade(runner)
 
@@ -1635,14 +1633,16 @@ def test_test_use_rechecks_profile_catalog_activates_turn_then_persists():
     assert calls[2][-6:] == ["models", "auth", "list", "--provider", "openai", "--json"]
     assert calls[3][-3:] == ["models", "status", "--json"]
     assert calls[4][-5:] == ["models", "list", "--provider", "openai", "--json"]
-    assert calls[5][-4:] == ["models", "auth", "activate", "openai:work"]
+    assert calls[5][-6:] == [
+        "models", "auth", "activate", "openai:work", "--agent", "main",
+    ]
     turn_call = calls[8]
     assert turn_call[4:6] == ["agent", "exec"]
     assert turn_call[turn_call.index("--cwd") + 1] == r"C:\empty-test-workspace"
     assert "--model" in turn_call
     assert turn_call[turn_call.index("--model") + 1] == "openai/gpt-6-astra@openai:work"
     assert "--fallback" not in turn_call
-    assert calls[11][-3:] == ["models", "set", "openai/gpt-6-astra"]
+    assert not any(call[-3:-1] == ["models", "set"] for call in calls)
 
 
 def test_saved_api_key_is_excluded_by_plan_only_order_during_test_use():
@@ -1651,7 +1651,6 @@ def test_saved_api_key_is_excluded_by_plan_only_order_during_test_use():
         "ok": True,
         "provider": "openai",
         "model": "gpt-6-astra",
-        "authProfileId": "openai:work",
     }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
@@ -1664,7 +1663,6 @@ def test_saved_api_key_is_excluded_by_plan_only_order_during_test_use():
         result(mixed), result(status_with_saved_api_key()),
         result(turn),
         result(mixed), result(status_with_saved_api_key()),
-        ProcessResult(0, "set", "", "completed"),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
@@ -1696,10 +1694,8 @@ def test_runtime_platform_key_is_dormant_under_plan_only_test_policy():
             "ok": True,
             "provider": "openai",
             "model": "gpt-6-astra",
-            "authProfileId": "openai:work",
         }),
         result(PLAN), result(platform_status),
-        ProcessResult(0, "set", "", "completed"),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
@@ -1765,39 +1761,53 @@ def test_activation_must_confirm_requested_profile_before_inference():
     assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
 
 
-@pytest.mark.parametrize(
-    "credential_fields",
-    [
-        {"authProfileId": "openai:api-key"},
-        {"authProfileId": "openai:work", "credentialSource": "api_key"},
-    ],
-)
-def test_wrong_actual_profile_identity_or_source_cannot_pass_or_persist(credential_fields):
-    turn = {
-        "ok": True,
-        "provider": "openai",
-        "model": "gpt-6-astra",
-        **credential_fields,
-    }
+def test_agent_exec_stable_envelope_needs_no_invented_profile_field():
+    turn = {"ok": True, "provider": "openai", "model": "gpt-6-astra"}
     runner = QueueRunner(
         result(PLAN), result(STATUS),
         result(PLAN), result(STATUS), result(CATALOG),
         ProcessResult(0, "", "", "completed"),
         result(PLAN), result(STATUS), result(turn),
+        result(PLAN), result(STATUS),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
-    assert body["ok"] is False
-    assert body["errorCode"] == "credential_proof_mismatch"
+    assert body["ok"] is True
     assert not any(call[0][-3:-1] == ["models", "set"] for call in runner.calls)
 
 
-def test_credential_source_added_during_turn_blocks_persist():
+def test_activation_model_must_match_requested_model_before_agent_exec():
+    activated_other = json.loads(json.dumps(STATUS))
+    activated_other["defaultModel"] = "openai/gpt-other"
+    activated_other["resolvedDefault"] = "openai/gpt-other"
+    runner = QueueRunner(
+        result(PLAN), result(STATUS),
+        result(PLAN), result(STATUS), result(CATALOG),
+        ProcessResult(0, "", "", "completed"),
+        result(PLAN), result(activated_other),
+    )
+    auth, handle = mapped_facade(runner)
+    body = auth.test_and_use(handle, "openai/gpt-6-astra")
+    assert body == {
+        "ok": False,
+        "selectedModel": "",
+        "effectiveProvider": "",
+        "testResult": "fail",
+        "errorCode": "profile_model_mismatch",
+    }
+    assert not any(call[0][4:6] == ["agent", "exec"] for call in runner.calls)
+
+
+def test_platform_route_result_after_turn_cannot_count_as_plan_proof():
     turn = {"ok": True, "provider": "openai", "model": "gpt-6-astra"}
     platform_status = status_with_openai(
         env={"value": "sk-…masked", "source": "OPENAI_API_KEY"},
         effective={"kind": "env", "detail": "sk-…masked"},
     )
+    platform_status["auth"]["runtimeAuthRoutes"][0]["effective"] = {
+        "kind": "env",
+        "detail": "OPENAI_API_KEY",
+    }
     runner = QueueRunner(
         result(PLAN), result(STATUS),
         result(PLAN), result(STATUS), result(CATALOG),
@@ -1808,7 +1818,7 @@ def test_credential_source_added_during_turn_blocks_persist():
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is False
-    assert body["errorCode"] == "credential_proof_mismatch"
+    assert body["errorCode"] == "billing_ambiguity"
     assert not any(call[0][-3:-1] == ["models", "set"] for call in runner.calls)
 
 
@@ -1873,7 +1883,6 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
         "ok": True,
         "provider": "openai",
         "model": "gpt-6-astra",
-        "authProfileId": SENSITIVE_PROFILE_ID,
     }
     runner = QueueRunner(
         result(SENSITIVE_PLAN), result(status),
@@ -1881,14 +1890,15 @@ def test_public_handle_maps_through_fresh_auth_list_without_exposing_email():
         ProcessResult(0, "", "", "completed"),
         result(SENSITIVE_PLAN), result(status), result(turn),
         result(SENSITIVE_PLAN), result(status),
-        ProcessResult(0, "", "", "completed"),
     )
     auth, handle = mapped_facade(runner)
     body = auth.test_and_use(handle, "openai/gpt-6-astra")
     assert body["ok"] is True
     assert SENSITIVE_PROFILE_ID not in json.dumps(body)
     activate = next(call[0] for call in runner.calls if "activate" in call[0])
-    assert activate[-1] == SENSITIVE_PROFILE_ID
+    assert activate[-6:] == [
+        "models", "auth", "activate", SENSITIVE_PROFILE_ID, "--agent", "main",
+    ]
 
 
 def test_public_handle_is_bound_to_current_profile_snapshot():

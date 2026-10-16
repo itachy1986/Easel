@@ -948,8 +948,20 @@ def _text_model_argv(preflight: dict[str, object]) -> list[str]:
 
 
 def _text_model_headers(preflight: dict[str, object]) -> dict[str, str]:
+    # OpenClaw 2026.9.7 validates x-openclaw-model before stripping an auth
+    # profile suffix, so an exact allowlist can reject the pinned ref.  Never
+    # remove the pin merely to make the Gateway request admissible: pinned
+    # plan turns use the CLI path below instead.
+    if preflight.get("authProfilePinned") is not False:
+        return {}
     argv = _text_model_argv(preflight)
     return {"x-openclaw-model": argv[1]} if argv else {}
+
+
+def _text_gateway_eligible(preflight: dict[str, object]) -> bool:
+    return preflight.get("authProfilePinned") is False and bool(
+        _text_model_headers(preflight)
+    )
 
 
 def _prepare_openai_text_inference() -> dict[str, object]:
@@ -2799,7 +2811,10 @@ async def api_chat_stream(req: ChatRequest):
 
         # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
         # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
-        is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+        is_http = (
+            (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+            and _text_gateway_eligible(preflight)
+        )
         if is_http:
             # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
             proc = _GatewayHttpProc()

@@ -164,7 +164,10 @@ def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unc
         }),
         encoding="utf-8",
     )
-    assert web._prepare_openai_text_inference()["billingRoute"] == "chatgpt_plan"
+    main_preflight = web._prepare_openai_text_inference()
+    assert main_preflight["billingRoute"] == "chatgpt_plan"
+    assert main_preflight["runtimeModel"] == "openai/gpt-6-astra@openai:work"
+    assert web._text_gateway_eligible(main_preflight) is False
     assert ("text-preflight", "openai/gpt-6-astra") in fake.calls
 
     fake.calls.clear()
@@ -187,7 +190,7 @@ def test_text_policy_uses_effective_main_agent_model_and_leaves_media_routes_unc
     assert fake.calls == []
 
 
-def test_text_runtime_pin_overrides_existing_session_model_for_cli_and_gateway():
+def test_text_runtime_pin_overrides_existing_session_model_for_cli_only():
     preflight = {
         "ok": True,
         "billingRoute": "chatgpt_plan",
@@ -199,9 +202,35 @@ def test_text_runtime_pin_overrides_existing_session_model_for_cli_and_gateway()
     assert web._text_model_argv(preflight) == [
         "--model", "openai/gpt-6-astra@openai:work",
     ]
-    assert web._text_model_headers(preflight) == {
-        "x-openclaw-model": "openai/gpt-6-astra@openai:work",
+    assert web._text_model_headers(preflight) == {}
+    assert web._text_gateway_eligible(preflight) is False
+
+
+def test_unpinned_explicit_fallback_route_remains_gateway_eligible():
+    preflight = {
+        "ok": True,
+        "billingRoute": "platform_fallback",
+        "errorCode": "platform_fallback_selected",
+        "runtimeModel": "openai/gpt-6-astra",
+        "authProfilePinned": False,
     }
+
+    assert web._text_model_headers(preflight) == {
+        "x-openclaw-model": "openai/gpt-6-astra",
+    }
+    assert web._text_gateway_eligible(preflight) is True
+
+
+def test_missing_pin_proof_is_not_gateway_eligible():
+    preflight = {
+        "ok": True,
+        "billingRoute": "chatgpt_plan",
+        "errorCode": "",
+        "runtimeModel": "openai/gpt-6-astra",
+    }
+
+    assert web._text_model_headers(preflight) == {}
+    assert web._text_gateway_eligible(preflight) is False
 
 
 def test_invalid_main_agent_model_fails_closed_instead_of_reusing_session_override(

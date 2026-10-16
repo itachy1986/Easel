@@ -1334,7 +1334,9 @@ class OpenAIPlanAuthFacade:
         if model not in allowed:
             return self._test_failure("plan_model_unavailable")
 
-        activated = self._run(["models", "auth", "activate", profile_id])
+        activated = self._run(
+            ["models", "auth", "activate", profile_id, "--agent", "main"]
+        )
         if activated.outcome != "completed" or activated.returncode != 0:
             return self._test_failure("profile_activation_failed")
 
@@ -1348,6 +1350,14 @@ class OpenAIPlanAuthFacade:
             return self._test_failure(
                 "profile_activation_unconfirmed" if proof_error == "billing_ambiguity" else proof_error
             )
+        # OpenClaw 2026.9.7 strips the trailing @profile from an explicit
+        # --model value before model selection.  The actual per-run credential
+        # pin therefore comes from the activated default route, not from the
+        # stable agent-exec JSON envelope (which intentionally exposes no
+        # credential identity).  A different activated model would cause the
+        # explicit override to lose configuredAuthProfileId, so fail closed.
+        if activated_assessment.selected_model != model:
+            return self._test_failure("profile_model_mismatch")
 
         # Use an empty one-shot workspace so this proof cannot include Easel's
         # repository, user files, or chat history in model context.
@@ -1366,8 +1376,6 @@ class OpenAIPlanAuthFacade:
             )
         if turn_error or not self._turn_proves_model(turn_payload, model):
             return self._test_failure("model_test_unproven")
-        if self._turn_credential_mismatch(turn_payload, profile_id):
-            return self._test_failure("credential_proof_mismatch")
 
         final_plans, final_assessment, final_error = self._current_credential_assessment()
         if final_error or final_assessment is None:
@@ -1378,9 +1386,6 @@ class OpenAIPlanAuthFacade:
         if proof_error:
             return self._test_failure(proof_error)
 
-        persisted = self._run(["models", "set", model])
-        if persisted.outcome != "completed" or persisted.returncode != 0:
-            return self._test_failure("model_persist_failed")
         return {
             "ok": True,
             "selectedModel": model,
@@ -1398,18 +1403,6 @@ class OpenAIPlanAuthFacade:
         if assessment.exclusive_plan_profile_id != requested_profile_id:
             return "billing_ambiguity"
         return ""
-
-    @staticmethod
-    def _turn_credential_mismatch(payload: Any, requested_profile_id: str) -> bool:
-        if not isinstance(payload, dict):
-            return True
-        actual_profile = payload.get("authProfileId")
-        if _safe_profile_id(actual_profile) != requested_profile_id:
-            return True
-        source = payload.get("credentialSource", payload.get("authSource"))
-        if source is not None and source not in {"oauth", "chatgpt_plan", "codex_plan"}:
-            return True
-        return False
 
     @staticmethod
     def _turn_proves_model(payload: Any, requested: str) -> bool:
