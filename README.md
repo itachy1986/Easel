@@ -332,6 +332,8 @@ easel skill quality-gate -i "这是一段待发布文案" -p 科技数码达人
 
 Web 工作台提供同样的能力，并额外管理会话、素材、账号、画像、内容库和发布状态。拖入对话框的素材会作为结构化附件传给 Agent，用户消息只显示实际输入的文字。
 
+Web「更多设置」可为**之后新建的对话**选择可选的 `Codex (Native)` 引擎；默认仍是 OpenClaw，已有会话不会切换。该模式通过本机已安装的 `codex app-server` 使用 Codex CLI 自己的登录与账户额度，Easel 不读取或复制 OpenClaw OAuth/API Key，也不会自动安装或登录 Codex。Native Codex 目前不覆盖 OpenClaw 的全部 Skills、社媒发布和媒体能力，且不能作为 ChatGPT Plan / C05-D 计费归属证明。
+
 ## 🧬 账号画像
 
 一个画像对应 `profiles/<名字>/` 目录，包含六个维度：定位、风格、受众、平台、偏好与红线、长期记忆。

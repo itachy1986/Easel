@@ -252,7 +252,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
             );
           })}
           {isStreaming && (stream!.questions?.length ?? 0) > 0 && (
-            <QuestionCards questions={stream!.questions || []} onDone={(qid) => onQuestionAnswered?.(qid)} />
+            <QuestionCards questions={stream!.questions || []} sessionId={session.id} onDone={(qid) => onQuestionAnswered?.(qid)} />
           )}
           <div ref={messagesEndRef} />
         </div>

@@ -228,6 +228,8 @@ easel skill social-content -i "Write a post introducing spatial intelligence"
 easel skill quality-gate -i "Review this draft" -p MyCreatorProfile
 ```
 
+In Web **More Settings**, an optional `Codex (Native)` engine can be selected for **new chats only**. OpenClaw remains the default and existing sessions never switch engines. This mode uses the installed `codex app-server` and the Codex CLI's own login/account quota; Easel neither reads nor copies OpenClaw OAuth/API keys and does not install or sign in to Codex automatically. Native Codex does not yet cover every OpenClaw Skill, social publishing, or media workflow, and it is not billing proof for ChatGPT Plan / C05-D.
+
 ## 🧬 Account Profiles
 
 Each profile is stored under `profiles/<name>/` and contains six dimensions: identity, style, audience, platforms, preferences and boundaries, and long-term memory.
