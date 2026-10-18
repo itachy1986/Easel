@@ -2174,19 +2174,24 @@ def _chat_runtime(req: ChatRequest) -> str:
     runtime = req.runtime or "openclaw"
     if runtime not in harness_store.IDS:
         raise HTTPException(400, "未知 Agent 执行引擎")
-    if not req.sessionId:
-        return runtime
-    try:
-        record = harness_store.binding(SESSIONS_DIR, req.sessionId)
-    except HarnessError as error:
-        raise HTTPException(409, str(error)) from error
-    owner = record.get("runtime")
-    if owner and owner != runtime:
-        raise HTTPException(409, f"此会话属于 {owner}；请新建对话使用 {runtime}")
-    if runtime == "codex" and not owner:
-        transcript = OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(req.sessionId)}.jsonl"
-        if transcript.is_file() or _transport_pin_file(req.sessionId).is_file():
-            raise HTTPException(409, "此会话已有 OpenClaw 历史；请新建对话使用 Codex (Native)")
+    owner = ""
+    if req.sessionId:
+        try:
+            record = harness_store.binding(SESSIONS_DIR, req.sessionId)
+        except HarnessError as error:
+            raise HTTPException(409, str(error)) from error
+        owner = record.get("runtime", "")
+        if owner and owner != runtime:
+            raise HTTPException(409, f"此会话属于 {owner}；请新建对话使用 {runtime}")
+        if runtime == "codex" and not owner:
+            transcript = OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(req.sessionId)}.jsonl"
+            if transcript.is_file() or _transport_pin_file(req.sessionId).is_file():
+                raise HTTPException(409, "此会话已有 OpenClaw 历史；请新建对话使用 Codex (Native)")
+    if runtime == "codex" and owner != "codex" and _harness_settings()["runtime"] != "codex":
+        raise HTTPException(
+            409,
+            "Codex (Native) 未在服务端启用；请先在「设置 → 更多设置」保存 Codex (Native)，再新建对话",
+        )
     return runtime
 
 
@@ -2530,6 +2535,7 @@ async def _run_native_codex(req: ChatRequest, sk: str, message: str, config: dic
     xlock = _CrossProcLock(sk)
     acquired = False
     locked = False
+    turn_started = False
     proc = _HarnessProc()
     task = asyncio.current_task()
 
@@ -2557,6 +2563,8 @@ async def _run_native_codex(req: ChatRequest, sk: str, message: str, config: dic
             raise HarnessError("此会话正在另一个窗口运行，请稍后再试")
         if _chat_runtime(req) != "codex":
             raise HarnessError("会话执行引擎已变化；请新建对话")
+        if _harness_settings() != config:
+            raise HarnessError("Agent 设置已变化；请重试本轮操作")
         record = harness_store.binding(SESSIONS_DIR, sk)
         native_id = record.get("native_id", "")
         harness_store.bind(SESSIONS_DIR, sk, "codex", native_id)
@@ -2564,6 +2572,7 @@ async def _run_native_codex(req: ChatRequest, sk: str, message: str, config: dic
         proc._task = task
         _RUNNING_CHAT[sk] = proc
         _save_turn(pk, "running", "", {"turn_id": turn_id, "runtime": "codex"})
+        turn_started = True
         request = RunRequest(
             message,
             PROJECT_ROOT,
@@ -2595,15 +2604,16 @@ async def _run_native_codex(req: ChatRequest, sk: str, message: str, config: dic
         error_message = "Codex 执行失败，请检查本机 CLI、登录和模型配置"
         emit("error", error_message)
     finally:
-        snapshot = "".join(full_text)
-        if error_message:
-            snapshot += f"\n\n❌ {error_message}"
-        _save_turn(pk, "done", snapshot, {
-            "turn_id": turn_id,
-            "clean_end": reason == "completed",
-            "stop_reason": reason,
-            "runtime": "codex",
-        })
+        if turn_started:
+            snapshot = "".join(full_text)
+            if error_message:
+                snapshot += f"\n\n❌ {error_message}"
+            _save_turn(pk, "done", snapshot, {
+                "turn_id": turn_id,
+                "clean_end": reason == "completed",
+                "stop_reason": reason,
+                "runtime": "codex",
+            })
         proc.finish()
         if _RUNNING_CHAT.get(sk) is proc:
             _RUNNING_CHAT.pop(sk, None)
@@ -2696,9 +2706,6 @@ async def api_chat_stream(req: ChatRequest):
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
 
-        # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
-        _save_turn(pk, "running", "", {"turn_id": turn_id})
-
         event_path = _job_event_file(turn_id)
         try:
             event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2731,6 +2738,10 @@ async def api_chat_stream(req: ChatRequest):
                 to_client("done", sessionKey=sk)
                 client_q.put_nowait(CLIENT_DONE)
             return
+
+        # Claim OpenClaw turns before waiting for locks, so recovery cannot return the previous turn.
+        # Native Codex claims its turn only after the fresh server-side opt-in recheck.
+        _save_turn(pk, "running", "", {"turn_id": turn_id})
 
         try:
             harness_store.bind(SESSIONS_DIR, sk, "openclaw")
