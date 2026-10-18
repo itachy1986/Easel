@@ -14,7 +14,7 @@ import { answerQuestion } from '../lib/api';
  * （gateway 对 multiSelect=false 的多值直接报 "does not allow multiple answers"，
  * 前端只按数据渲染，不绕过校验）。
  */
-function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnswered: () => void }) {
+function QuestionCard({ question, sessionId, onAnswered }: { question: ChatQuestion; sessionId?: string; onAnswered: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<Record<string, string[]>>({});
@@ -60,7 +60,7 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
     const answers: Record<string, string[]> = {};
     for (const it of items) answers[it.questionId] = valsOf(it);
     try {
-      const res = await answerQuestion({ questionId: question.id, answers });
+      const res = await answerQuestion({ sessionId, questionId: question.id, answers });
       if (!res.ok) setError(res.error || '提交失败');
       else onAnswered();
     } catch (e) {
@@ -156,7 +156,7 @@ function QuestionCard({ question, onAnswered }: { question: ChatQuestion; onAnsw
 }
 
 /** 流式中的 ask_user 问答题列表（一次性卡片，答完即从当前流移除）。 */
-export default function QuestionCards({ questions, onDone }: { questions: ChatQuestion[]; onDone?: (questionId: string) => void }) {
+export default function QuestionCards({ questions, sessionId, onDone }: { questions: ChatQuestion[]; sessionId?: string; onDone?: (questionId: string) => void }) {
   const [answered, setAnswered] = useState<Record<string, boolean>>({});
   const visible = useMemo(
     () => questions.filter((q) => !answered[q.id]),
@@ -166,7 +166,7 @@ export default function QuestionCards({ questions, onDone }: { questions: ChatQu
   return (
     <>
       {visible.map((q) => (
-        <QuestionCard key={q.id} question={q} onAnswered={() => {
+        <QuestionCard key={q.id} question={q} sessionId={sessionId} onAnswered={() => {
           setAnswered((a) => ({ ...a, [q.id]: true }));
           onDone?.(q.id);   // 通知 App：此题已答，重放/恢复不再出现
         }} />

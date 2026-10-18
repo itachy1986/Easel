@@ -40,6 +40,9 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from easel.gateway_endpoint import chat_completions_url, healthz_url, port_source
+from easel import harnesses
+from easel.harnesses import store as harness_store
+from easel.harnesses.base import HarnessError, RunRequest
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.openai_plan_auth import (
     ActiveJobError,
@@ -436,6 +439,8 @@ async def _lifespan(_app: FastAPI):
     yield
     OPENAI_PLAN_AUTH.shutdown()
     _stop_mp_login_on_shutdown()
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
 
 
 app = FastAPI(title="Easel", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -1439,6 +1444,50 @@ async def api_settings_models():
     return _model_channels()
 
 
+class HarnessSettingsRequest(BaseModel):
+    runtime: str
+    model: str = Field(default="", max_length=240)
+    sandbox: str = "workspace-write"
+
+
+def _harness_settings() -> dict:
+    try:
+        return harness_store.settings(OUTPUTS_DIR)
+    except HarnessError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/settings/harness")
+async def api_harness_settings():
+    config = _harness_settings()
+    agents = await asyncio.to_thread(
+        lambda: [harnesses.describe(runtime) for runtime in harness_store.IDS]
+    )
+    return {**config, "agents": agents}
+
+
+@app.post("/api/settings/harness")
+async def api_harness_settings_save(req: HarnessSettingsRequest):
+    if req.runtime not in harness_store.IDS:
+        raise HTTPException(400, "未知 Agent 执行引擎")
+    if req.sandbox not in ("read-only", "workspace-write"):
+        raise HTTPException(400, "请选择只读或工作区写入权限")
+    if any(ord(character) < 32 for character in req.model):
+        raise HTTPException(400, "模型名称不能包含控制字符")
+    if _RUNNING_CHAT or _BG_TASKS:
+        raise HTTPException(409, "请等待当前对话完成或停止后切换新会话默认引擎")
+    if req.runtime == "codex" and not harnesses.describe("codex")["installed"]:
+        raise HTTPException(409, "Codex CLI 未安装；请在终端自行安装并登录，Easel 不会自动操作账号")
+    config = _harness_settings()
+    config["runtime"] = req.runtime
+    config["sandbox"] = req.sandbox
+    config["models"] = {**config["models"], req.runtime: req.model.strip()}
+    harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
+    from easel.harnesses.rpc import close_sessions
+    await close_sessions()
+    return await api_harness_settings()
+
+
 def _write_env_direct(updates: dict[str, str]) -> None:
     """后端受控键位专用：就地更新/追加 .env（不做 allowlist 过滤，仅服务端固定映射调用）。原子写。"""
     updates = {k: v for k, v in updates.items() if k and v.strip() != ''}
@@ -2116,7 +2165,34 @@ class ChatRequest(BaseModel):
     persona: str | None = None
     sessionId: str | None = None
     turnId: str | None = None
+    runtime: str | None = None
     attachments: list[AttachmentRef] = Field(default_factory=list)
+
+
+def _chat_runtime(req: ChatRequest) -> str:
+    """Resolve a browser-latched runtime without re-owning existing history."""
+    runtime = req.runtime or "openclaw"
+    if runtime not in harness_store.IDS:
+        raise HTTPException(400, "未知 Agent 执行引擎")
+    owner = ""
+    if req.sessionId:
+        try:
+            record = harness_store.binding(SESSIONS_DIR, req.sessionId)
+        except HarnessError as error:
+            raise HTTPException(409, str(error)) from error
+        owner = record.get("runtime", "")
+        if owner and owner != runtime:
+            raise HTTPException(409, f"此会话属于 {owner}；请新建对话使用 {runtime}")
+        if runtime == "codex" and not owner:
+            transcript = OPENCLAW_SESSIONS_DIR / f"{_openclaw_session_id(req.sessionId)}.jsonl"
+            if transcript.is_file() or _transport_pin_file(req.sessionId).is_file():
+                raise HTTPException(409, "此会话已有 OpenClaw 历史；请新建对话使用 Codex (Native)")
+    if runtime == "codex" and owner != "codex" and _harness_settings()["runtime"] != "codex":
+        raise HTTPException(
+            409,
+            "Codex (Native) 未在服务端启用；请先在「设置 → 更多设置」保存 Codex (Native)，再新建对话",
+        )
+    return runtime
 
 
 def _attachment_scope(session_id: str) -> str:
@@ -2409,6 +2485,142 @@ _BG_TASKS: set = set()
 _RUNNING_CHAT: dict = {}
 # 被用户显式停止的会话 key：supervisor 据此把本轮当作正常「已停止」收尾（不报「被中断」、释放会话锁）。
 _STOPPED_CHAT: set = set()
+_HARNESS_QUESTIONS: dict[str, dict] = {}
+
+
+class _HarnessProc(_GatewayHttpProc):
+    """Expose an asyncio native turn through the existing stop endpoint."""
+
+    def terminate(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.get_loop().call_soon_threadsafe(self._task.cancel)
+
+
+def _native_codex_env() -> dict[str, str]:
+    """Pass only OS/CLI discovery state; never inherit provider credentials."""
+    allowed = {
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+        "HOME", "HOMEDRIVE", "HOMEPATH", "SYSTEMDRIVE", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+        "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+        "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "LANG", "CODEX_HOME",
+    }
+    return {
+        key: value for key, value in os.environ.items()
+        if key.upper() in allowed or key.upper().startswith("LC_")
+    }
+
+
+async def _harness_ask(sk: str, questions: list[dict], emit) -> dict[str, list[str]]:
+    identifier = "harness_" + uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    record = {"session": sk, "future": future, "status": "pending", "questions": questions}
+    _HARNESS_QUESTIONS[identifier] = record
+    try:
+        emit("question", json.dumps({"id": identifier, "questions": questions}, ensure_ascii=False))
+        answers = await asyncio.wait_for(future, TIMEOUT_CHAT)
+        record["status"] = "resolved"
+        return answers
+    finally:
+        _HARNESS_QUESTIONS.pop(identifier, None)
+
+
+async def _run_native_codex(req: ChatRequest, sk: str, message: str, config: dict, emit) -> None:
+    """Run one Codex turn while preserving Easel's lock, recovery and stop semantics."""
+    pk = f"web:{sk}"
+    turn_id = req.turnId or uuid.uuid4().hex
+    full_text: list[str] = []
+    error_message = ""
+    reason = "error"
+    lock = _session_lock(sk)
+    xlock = _CrossProcLock(sk)
+    acquired = False
+    locked = False
+    turn_started = False
+    proc = _HarnessProc()
+    task = asyncio.current_task()
+
+    def receive(kind: str, text: str) -> None:
+        safe = str(text)[:200000]
+        if kind == "token":
+            full_text.append(safe)
+        emit(kind, safe)
+
+    async def ask(questions: list[dict]) -> dict[str, list[str]]:
+        return await _harness_ask(sk, questions, receive)
+
+    try:
+        if lock.locked():
+            emit("activity", "这个会话上一条还在运行，等待完成…")
+        await lock.acquire()
+        locked = True
+        deadline = time.monotonic() + min(TIMEOUT_CHAT, 300)
+        while not acquired and time.monotonic() < deadline:
+            acquired = xlock.acquire(0)
+            if not acquired:
+                xlock.release()
+                await asyncio.sleep(0.2)
+        if not acquired:
+            raise HarnessError("此会话正在另一个窗口运行，请稍后再试")
+        if _chat_runtime(req) != "codex":
+            raise HarnessError("会话执行引擎已变化；请新建对话")
+        if _harness_settings() != config:
+            raise HarnessError("Agent 设置已变化；请重试本轮操作")
+        record = harness_store.binding(SESSIONS_DIR, sk)
+        native_id = record.get("native_id", "")
+        harness_store.bind(SESSIONS_DIR, sk, "codex", native_id)
+        _STOPPED_CHAT.discard(sk)
+        proc._task = task
+        _RUNNING_CHAT[sk] = proc
+        _save_turn(pk, "running", "", {"turn_id": turn_id, "runtime": "codex"})
+        turn_started = True
+        request = RunRequest(
+            message,
+            PROJECT_ROOT,
+            {**_native_codex_env(), "EASEL_AGENT_RUNTIME": "codex"},
+            native_id=native_id,
+            model=config["models"].get("codex", ""),
+            sandbox=config["sandbox"],
+            timeout=TIMEOUT_CHAT,
+            session_key=sk,
+        )
+        await asyncio.wait_for(harnesses.adapter("codex").run(
+            request,
+            receive,
+            ask,
+            lambda identifier: harness_store.bind(SESSIONS_DIR, sk, "codex", identifier),
+        ), TIMEOUT_CHAT)
+        reason = "completed"
+    except asyncio.CancelledError:
+        reason = "user_stopped" if sk in _STOPPED_CHAT else "shutdown"
+        emit("activity", "已停止" if reason == "user_stopped" else "服务关闭，本轮已取消")
+    except asyncio.TimeoutError:
+        reason = "timeout"
+        error_message = "Codex 执行超时，已终止本轮进程"
+        emit("error", error_message)
+    except (HarnessError, HTTPException) as error:
+        error_message = str(error.detail if isinstance(error, HTTPException) else error)
+        emit("error", error_message)
+    except Exception:
+        error_message = "Codex 执行失败，请检查本机 CLI、登录和模型配置"
+        emit("error", error_message)
+    finally:
+        if turn_started:
+            snapshot = "".join(full_text)
+            if error_message:
+                snapshot += f"\n\n❌ {error_message}"
+            _save_turn(pk, "done", snapshot, {
+                "turn_id": turn_id,
+                "clean_end": reason == "completed",
+                "stop_reason": reason,
+                "runtime": "codex",
+            })
+        proc.finish()
+        if _RUNNING_CHAT.get(sk) is proc:
+            _RUNNING_CHAT.pop(sk, None)
+        _STOPPED_CHAT.discard(sk)
+        xlock.release()
+        if locked:
+            lock.release()
 
 
 @app.get("/api/chat/last/{session_id}")
@@ -2475,6 +2687,8 @@ async def api_chat_stream(req: ChatRequest):
     token delta 转成 SSE `token`、thinking delta 转成 `thinking`。stdout 仅留作错误/兜底。
     """
     # 每轮末尾追加「先查技能库」提醒，抗长对话指令衰减（对用户不可见）
+    runtime = _chat_runtime(req)
+    config = _harness_settings() if runtime == "codex" else None
     message = _chat_message(req)
 
     # supervisor（跑 openclaw run）与 forward（转发 SSE 给浏览器）之间的事件通道。
@@ -2491,9 +2705,6 @@ async def api_chat_stream(req: ChatRequest):
         event_seq = 0
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
-
-        # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
-        _save_turn(pk, "running", "", {"turn_id": turn_id})
 
         event_path = _job_event_file(turn_id)
         try:
@@ -2517,6 +2728,28 @@ async def api_chat_stream(req: ChatRequest):
 
         # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
         to_client("activity", "⏳ 已收到，正在唤醒 agent…")
+
+        if runtime == "codex":
+            try:
+                await _run_native_codex(
+                    req.model_copy(update={"turnId": turn_id}), sk, message, config or {}, to_client,
+                )
+            finally:
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+            return
+
+        # Claim OpenClaw turns before waiting for locks, so recovery cannot return the previous turn.
+        # Native Codex claims its turn only after the fresh server-side opt-in recheck.
+        _save_turn(pk, "running", "", {"turn_id": turn_id})
+
+        try:
+            harness_store.bind(SESSIONS_DIR, sk, "openclaw")
+        except HarnessError as error:
+            to_client("error", str(error))
+            to_client("done", sessionKey=sk)
+            client_q.put_nowait(CLIENT_DONE)
+            return
 
         async def _run_gateway_turn(hproc):
             """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。
@@ -3062,6 +3295,19 @@ class QuestionAnswerRequest(BaseModel):
 @app.post("/api/chat/question/answer")
 async def api_question_answer(req: QuestionAnswerRequest):
     """前端点击 ask_user 选项后调用：转发 gateway question.resolve，让等待的 agent 拿到答案。"""
+    if req.questionId.startswith("harness_"):
+        record = _HARNESS_QUESTIONS.get(req.questionId)
+        if record is None:
+            return {"ok": False, "error": "权限或问答请求已过期，请重试"}
+        if not req.sessionId or record["session"] != req.sessionId:
+            raise HTTPException(403, "此请求不属于当前会话")
+        required = {question["questionId"] for question in record["questions"]}
+        if set(req.answers or {}) != required:
+            raise HTTPException(400, "回答与当前问题不匹配")
+        if record["future"].done():
+            return {"ok": False, "error": "请求已回答"}
+        record["future"].set_result(req.answers)
+        return {"ok": True}
     if GatewayClient is None:
         return {"ok": False, "error": "gateway question bridge unavailable"}
     client = GatewayClient()
@@ -3076,12 +3322,24 @@ async def api_question_answer(req: QuestionAnswerRequest):
 
 
 class QuestionStatusRequest(BaseModel):
+    sessionId: str | None = None
     questionIds: list[str]
 
 
 @app.post("/api/chat/question/status")
 async def api_question_status(req: QuestionStatusRequest):
     """批量查 question 状态（重放旧事件时过滤已解决的题）。"""
+    if req.questionIds and all(identifier.startswith("harness_") for identifier in req.questionIds):
+        if not req.sessionId or any(
+            _HARNESS_QUESTIONS.get(identifier, {}).get("session") != req.sessionId
+            for identifier in req.questionIds
+            if identifier in _HARNESS_QUESTIONS
+        ):
+            raise HTTPException(403, "此请求不属于当前会话")
+        return {"ok": True, "questions": {
+            identifier: {"status": _HARNESS_QUESTIONS.get(identifier, {}).get("status", "not_found")}
+            for identifier in req.questionIds
+        }}
     if GatewayClient is None:
         return {"ok": False, "questions": {}}
     client = GatewayClient()
@@ -4180,6 +4438,18 @@ def _write_baseline_profile(name: str, form: dict) -> None:
 @app.delete("/api/session/{session_key}")
 async def api_delete_session(session_key: str):
     """删除 OpenClaw 本地的 session 记录。"""
+    if session_key in _RUNNING_CHAT or _session_lock(session_key).locked():
+        raise HTTPException(409, "请先停止当前对话再删除")
+    try:
+        record = harness_store.binding(SESSIONS_DIR, session_key)
+    except HarnessError as error:
+        raise HTTPException(409, str(error)) from error
+    if record.get("runtime") == "codex":
+        from easel.harnesses.rpc import close_sessions
+        await close_sessions(session_key)
+        harness_store.binding_path(SESSIONS_DIR, session_key).unlink(missing_ok=True)
+        _turn_file(f"web:{session_key}").unlink(missing_ok=True)
+        return {"deleted": True, "nativeHistoryDeleted": False}
     sessions_file = _oc_state_dir() / 'agents' / 'main' / 'sessions' / 'sessions.json'
     if not sessions_file.is_file():
         return {'deleted': False, 'reason': 'sessions file not found'}

@@ -9,8 +9,10 @@ import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
   fetchModelChannels, runChannelSelftest, saveModelConfig,
   fetchLocalAgents, enableLocalAgent, fetchAvailableModels,
+  fetchHarnessSettings, saveHarnessSettings,
 } from '../lib/api';
-import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo } from '../lib/api';
+import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo, HarnessSettingsResponse } from '../lib/api';
+import { savePreferredRuntime } from '../lib/store';
 import { IconSlidersHorizontal, IconPackage, IconEllipsis } from './settingsIcons';
 
 interface Props { onClose: () => void; }
@@ -59,6 +61,42 @@ export default function SettingsPanel({ onClose }: Props) {
   const [sec, setSec] = useState<Sec>('model');
   const [chan, setChan] = useState<Chan>('chat');
   const [planSummary, setPlanSummary] = useState<ChatGPTPlanSummary | null>(null);
+  const [harness, setHarness] = useState<HarnessSettingsResponse | null>(null);
+  const [harnessRuntime, setHarnessRuntime] = useState<'openclaw' | 'codex'>('openclaw');
+  const [harnessModel, setHarnessModel] = useState('');
+  const [harnessSandbox, setHarnessSandbox] = useState<'read-only' | 'workspace-write'>('workspace-write');
+  const [harnessSaving, setHarnessSaving] = useState(false);
+  const [harnessNote, setHarnessNote] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    fetchHarnessSettings().then((value) => {
+      if (!alive) return;
+      setHarness(value);
+      setHarnessRuntime(value.runtime);
+      setHarnessModel(value.models[value.runtime] || '');
+      setHarnessSandbox(value.sandbox);
+      savePreferredRuntime(value.runtime);
+    }).catch((error) => {
+      if (alive) setHarnessNote(error instanceof Error ? error.message : '执行引擎状态读取失败');
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const saveHarness = useCallback(async () => {
+    setHarnessSaving(true);
+    setHarnessNote('');
+    try {
+      const value = await saveHarnessSettings(harnessRuntime, harnessModel, harnessSandbox);
+      setHarness(value);
+      savePreferredRuntime(value.runtime);
+      setHarnessNote('已保存；仅新建对话使用该引擎，现有会话保持不变。');
+    } catch (error) {
+      setHarnessNote(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setHarnessSaving(false);
+    }
+  }, [harnessModel, harnessRuntime, harnessSandbox]);
 
   // ── 环境安装（引擎真实数据） ──────────────────────────────
   const [tools, setTools] = useState<EnvTool[]>([]);
@@ -787,14 +825,44 @@ export default function SettingsPanel({ onClose }: Props) {
             {sec === 'more' && (
               <section className="st-sec active">
                 <div className="panel-top">
-                  <span className="pill off"><span className="dot" />可扩展位</span>
-                  <span className="desc">同一个面板，以后放更多设置</span>
+                  <span className="pill ok"><span className="dot" />执行引擎</span>
+                  <span className="desc">选择只影响之后新建的对话</span>
                 </div>
-                <div className="board">
-                  <div className="stub-row"><span className="tag2">预留</span>网关参数（端口 / 绑定 / 会话）<span className="future">就挂在这页旁边</span></div>
-                  <div className="stub-row"><span className="tag2">预留</span>通用设置（语言 / 更新 / 数据目录）<span className="future">按需加</span></div>
+                <div className="board native-engine-board">
+                  <label className={`native-engine-option${harnessRuntime === 'openclaw' ? ' selected' : ''}`}>
+                    <input type="radio" name="agent-runtime" value="openclaw"
+                      checked={harnessRuntime === 'openclaw'}
+                      onChange={() => { setHarnessRuntime('openclaw'); setHarnessModel(harness?.models.openclaw || ''); }} />
+                    <span><strong>OpenClaw</strong><small>默认 · 保留 Easel 完整 Gateway、Skills、发布和媒体流程</small></span>
+                  </label>
+                  <label className={`native-engine-option${harnessRuntime === 'codex' ? ' selected' : ''}${harness?.agents.find((a) => a.id === 'codex')?.installed ? '' : ' disabled'}`}>
+                    <input type="radio" name="agent-runtime" value="codex"
+                      checked={harnessRuntime === 'codex'}
+                      disabled={!harness?.agents.find((a) => a.id === 'codex')?.installed}
+                      onChange={() => { setHarnessRuntime('codex'); setHarnessModel(harness?.models.codex || ''); }} />
+                    <span><strong>Codex (Native)</strong><small>使用现有 Codex CLI 登录与账户额度；不会自动安装或登录</small></span>
+                  </label>
+                  {harnessRuntime === 'codex' && (
+                    <div className="native-engine-fields">
+                      <label>模型（留空使用 Codex 默认）<input className="mock" value={harnessModel}
+                        maxLength={240} onChange={(event) => setHarnessModel(event.target.value)} /></label>
+                      <label>沙箱<select value={harnessSandbox}
+                        onChange={(event) => setHarnessSandbox(event.target.value as 'read-only' | 'workspace-write')}>
+                        <option value="workspace-write">工作区写入</option>
+                        <option value="read-only">只读</option>
+                      </select></label>
+                    </div>
+                  )}
+                  {!harness?.agents.find((a) => a.id === 'codex')?.installed && (
+                    <div className="foot-note">Codex CLI 未检测到。请在终端自行安装并执行 codex login；Easel 不会代装或读取登录凭据。</div>
+                  )}
+                  <div className="native-engine-actions">
+                    <button className="btn btn-sm btn-primary" disabled={!harness || harnessSaving}
+                      onClick={() => void saveHarness()}>{harnessSaving ? '保存中…' : '保存执行引擎'}</button>
+                    {harnessNote && <span className="foot-note">{harnessNote}</span>}
+                  </div>
                 </div>
-                <div className="foot-note">扩展方式：在这个面板里加标签即可——模型、环境已各就位，其余按需加。</div>
+                <div className="foot-note">Native Codex is optional. 它不等同于 OpenClaw/ChatGPT Plan，也不覆盖全部 Easel Skills、社媒发布或媒体能力；本选项不能证明 C05-D 计费归属。</div>
               </section>
             )}
           </div>

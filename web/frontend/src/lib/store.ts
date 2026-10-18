@@ -18,6 +18,7 @@ export interface ChatSession {
   sessionKey?: string;  // OpenClaw 的 session key，用于后端删除
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
+  runtime?: 'openclaw' | 'codex'; // 创建时锁定；旧会话缺省仍为 OpenClaw
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */
@@ -91,6 +92,7 @@ export function savePublishDraft(d: PublishDraft): void {
 
 const STORAGE_KEY = 'easel_sessions';
 const ACTIVE_KEY = 'easel_active_session';
+const RUNTIME_KEY = 'easel_agent_runtime';
 const MAX_SESSIONS = 100;
 const TITLE_MAX_CHARS = 24;
 
@@ -118,6 +120,7 @@ export function loadSessions(): ChatSession[] {
     // 防御：损坏/缺字段的会话（旧版写入或写中断）恢复成可用形态，绝不让渲染期崩。
     return sessions.map((session) => ({
       ...session,
+      runtime: session.runtime ?? 'openclaw',
       messages: Array.isArray(session.messages)
         ? session.messages.map((message) => {
             if (message?.role !== 'user' || message.agentContent || !message.content?.includes('【附件素材】')) {
@@ -153,12 +156,22 @@ export function saveSessions(sessions: ChatSession[]): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(prune(sessions)));
 }
 
+export function loadPreferredRuntime(): 'openclaw' | 'codex' {
+  try { return localStorage.getItem(RUNTIME_KEY) === 'codex' ? 'codex' : 'openclaw'; }
+  catch { return 'openclaw'; }
+}
+
+export function savePreferredRuntime(runtime: 'openclaw' | 'codex'): void {
+  try { localStorage.setItem(RUNTIME_KEY, runtime); } catch { /* quota/private mode */ }
+}
+
 export function createSession(persona?: string): ChatSession {
   return {
     id: generateId(),
     title: 'New Chat',
     messages: [],
     persona,
+    runtime: loadPreferredRuntime(),
     created: Date.now(),
   };
 }

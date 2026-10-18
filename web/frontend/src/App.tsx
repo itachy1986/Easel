@@ -15,7 +15,7 @@ import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
-import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from './lib/api';
+import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat, fetchHarnessSettings } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
@@ -26,6 +26,7 @@ import {
   updateSessionTitle,
   loadActiveId,
   saveActiveId,
+  savePreferredRuntime,
 } from './lib/store';
 import type { ChatSession, ChatMessage, StreamState } from './lib/store';
 
@@ -171,6 +172,9 @@ export default function App() {
       .catch(() => {
         setGatewayStatus('disconnected');
       });
+    fetchHarnessSettings()
+      .then((settings) => savePreferredRuntime(settings.runtime))
+      .catch(() => { /* OpenClaw remains the safe default */ });
   }, []);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
@@ -256,6 +260,7 @@ export default function App() {
     persona: string | undefined,
     attachments: UploadedFile[] = [],
   ) => {
+    const runtime = sessionsRef.current.find((s) => s.id === sessionId)?.runtime ?? 'openclaw';
     const turnId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     try { sessionStorage.setItem(`easel_pending_turn:${sessionId}`, turnId); } catch { /* ignore */ }
     setSessions((prev) => {
@@ -338,7 +343,7 @@ export default function App() {
         const a = streamAcc.current[sessionId]; if (!a) return;
         if (a.questions.some((x) => x.id === q.id)) return;
         if (answeredRef.current.has(q.id)) return;   // 本会话已答过：不再重现
-        void questionStatus([q.id]).then((st) => {
+        void questionStatus([q.id], sessionId).then((st) => {
           const s = st[q.id]?.status;
           // 只显示仍 pending 的：answered/expired/cancelled/not_found/unknown 一律过滤
           if (s && s !== 'pending' || answeredRef.current.has(q.id)) return;
@@ -351,6 +356,7 @@ export default function App() {
       },
       // onHeartbeat：防呆心跳（30s 静默）。只设独立的「未卡住」提示，绝不写 activity/thinking → 不顶掉真实状态。
       (note) => setStreams((p) => (p[sessionId] ? { ...p, [sessionId]: { ...p[sessionId], stillWorking: note } } : p)),
+      runtime,
     );
   }, [appendAssistant, clearStream]);
 
@@ -446,7 +452,7 @@ export default function App() {
         if (answeredRef.current.has(q.id)) return;   // 本会话已答过：不再重现
         // 重放可能带已解决/已过期的旧问题（gateway 15s 后即清理）——先查状态只留 pending；
         // 查询失败时保留原样（宁显示不丢题）。
-        void questionStatus([q.id]).then((st) => {
+        void questionStatus([q.id], sessionId).then((st) => {
           const s = st[q.id]?.status;
           // 只显示仍 pending 的：answered/expired/cancelled/not_found/unknown 一律过滤
           //（unknown 通常=问题已从 gateway 清理，即已答或已过期，重放旧事件时不该重现）
@@ -460,6 +466,7 @@ export default function App() {
       },
       // onHeartbeat：同上，独立的「未卡住」提示，不覆盖 activity/thinking。
       (note) => setStreams((p) => (p[sessionId] ? { ...p, [sessionId]: { ...p[sessionId], stillWorking: note } } : p)),
+      s?.runtime ?? 'openclaw',
     );
   }, [appendAssistant, clearStream]);
 

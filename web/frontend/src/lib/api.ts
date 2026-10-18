@@ -30,6 +30,30 @@ export interface StatusResponse {
   personas: PersonaItem[];
 }
 
+export interface HarnessSettingsResponse {
+  runtime: 'openclaw' | 'codex';
+  models: Record<string, string>;
+  sandbox: 'read-only' | 'workspace-write';
+  agents: {
+    id: 'openclaw' | 'codex'; label: string; protocol: string;
+    installed: boolean; install_hint: string;
+  }[];
+}
+
+export function fetchHarnessSettings(): Promise<HarnessSettingsResponse> {
+  return request('/api/settings/harness');
+}
+
+export function saveHarnessSettings(
+  runtime: 'openclaw' | 'codex', model: string, sandbox: 'read-only' | 'workspace-write',
+): Promise<HarnessSettingsResponse> {
+  return request('/api/settings/harness', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runtime, model, sandbox }),
+  });
+}
+
 export interface PersonaItem {
   name: string;
   description: string;
@@ -312,7 +336,7 @@ export interface ChatQuestion {
   expiresAtMs?: number;
 }
 export async function answerQuestion(
-  payload: { questionId: string; answers: Record<string, string[]>; resolvedBy?: string },
+  payload: { sessionId?: string; questionId: string; answers: Record<string, string[]>; resolvedBy?: string },
 ): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch(`${BASE}/api/chat/question/answer`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -324,13 +348,13 @@ export async function answerQuestion(
 
 /** 批量查 question 状态：过滤重放中已解决/已过期的旧题。 */
 export async function questionStatus(
-  questionIds: string[],
+  questionIds: string[], sessionId?: string,
 ): Promise<Record<string, { status: string }>> {
   if (!questionIds.length) return {};
   try {
     const res = await fetch(`${BASE}/api/chat/question/status`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ questionIds }),
+      body: JSON.stringify({ questionIds, sessionId }),
     });
     const data = await res.json().catch(() => ({})) as { ok?: boolean; questions?: Record<string, { status: string }> };
     return data.questions || {};
@@ -560,6 +584,7 @@ export function streamChat(
   attachments: UploadedFile[] = [],
   onQuestion?: (q: ChatQuestion) => void,
   onHeartbeat?: (note: string) => void,
+  runtime: 'openclaw' | 'codex' = 'openclaw',
 ): AbortController {
   const controller = new AbortController();
   let lastEventId = 0;
@@ -647,7 +672,7 @@ export function streamChat(
         const res = first
           ? await fetch(`${BASE}/api/chat/stream`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message, persona: persona || undefined, sessionId, turnId, attachments }),
+              body: JSON.stringify({ message, persona: persona || undefined, sessionId, turnId, attachments, runtime }),
               signal: controller.signal,
             })
           : await fetch(`${BASE}/api/chat/jobs/${encodeURIComponent(turnId || '')}/stream?after=${lastEventId}`, {
