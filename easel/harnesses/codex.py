@@ -27,6 +27,21 @@ class CodexAdapter:
         streamed: set[str] = set()
 
         def notify(method, params):
+            def thread_scoped() -> bool:
+                if params.get("threadId") is None and params.get("turnId") is None:
+                    return True
+                return bool(turn_id) and params.get("threadId") == thread_id \
+                    and params.get("turnId", turn_id) == turn_id
+
+            if method == "error":
+                if params.get("willRetry", False) or not thread_scoped():
+                    return
+                if not completion.done():
+                    completion.set_exception(HarnessError(
+                        "Codex 执行失败，请检查原生登录与模型配置"
+                    ))
+                return
+
             if not turn_id or params.get("threadId") != thread_id or params.get("turnId", turn_id) != turn_id:
                 return
             if method == "item/agentMessage/delta":
@@ -53,9 +68,6 @@ class CodexAdapter:
                     completion.set_exception(HarnessError(
                         str(error.get("message") or f"Codex 本轮未完成：{turn.get('status')}")
                     ))
-            elif method == "error" and not params.get("willRetry", False) and not completion.done():
-                completion.set_exception(HarnessError("Codex 执行失败，请检查原生登录与模型配置"))
-
         async def respond(method, params):
             if params.get("threadId") != thread_id or (turn_id and params.get("turnId", turn_id) != turn_id):
                 raise HarnessError("不属于当前会话的请求")

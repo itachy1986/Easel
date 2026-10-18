@@ -35,6 +35,19 @@ while True:
     elif method == "initialized":
         pass
     elif method == "thread/start":
+        if mode == "early-fatal":
+            send({"method": "error", "params": {
+                "message": "authentication failed", "willRetry": False,
+            }})
+        elif mode == "early-foreign-fatal":
+            send({"method": "error", "params": {
+                "message": "another thread failed", "willRetry": False,
+                "threadId": "foreign-thread", "turnId": "foreign-turn",
+            }})
+        elif mode == "early-retryable":
+            send({"method": "error", "params": {
+                "message": "temporary transport failure", "willRetry": True,
+            }})
         reply(message, {"thread": {"id": thread_id}})
     elif method == "thread/resume":
         resumed = message["params"]["threadId"]
