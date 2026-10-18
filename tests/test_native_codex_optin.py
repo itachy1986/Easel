@@ -70,6 +70,52 @@ def test_native_codex_rejects_thread_replacement(tmp_path):
         ))
 
 
+def test_native_codex_surfaces_unscoped_fatal_error_before_turn_latch(tmp_path):
+    async def reject(_questions):
+        raise AssertionError("unexpected approval")
+
+    with pytest.raises(HarnessError, match="Codex 执行失败"):
+        asyncio.run(CodexAdapter().run(
+            _request(tmp_path, mode="early-fatal"),
+            lambda *_args: None, reject, lambda _value: None,
+        ))
+
+
+def test_native_codex_continues_after_early_fatal_error(tmp_path):
+    async def reject(_questions):
+        raise AssertionError("unexpected approval")
+
+    async def run():
+        with pytest.raises(HarnessError, match="Codex 执行失败"):
+            await CodexAdapter().run(
+                _request(tmp_path, mode="early-fatal"),
+                lambda *_args: None, reject, lambda _value: None,
+            )
+
+        events: list[tuple[str, str]] = []
+        await CodexAdapter().run(
+            _request(tmp_path, native_id="codex-thread"),
+            lambda kind, text: events.append((kind, text)), reject, lambda _value: None,
+        )
+        assert ("token", "完成") in events
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["early-foreign-fatal", "early-retryable"])
+def test_native_codex_ignores_nonfatal_early_errors(tmp_path, mode):
+    events: list[tuple[str, str]] = []
+
+    async def reject(_questions):
+        raise AssertionError("unexpected approval")
+
+    asyncio.run(CodexAdapter().run(
+        _request(tmp_path, mode=mode),
+        lambda kind, text: events.append((kind, text)), reject, lambda _value: None,
+    ))
+    assert ("token", "完成") in events
+
+
 @pytest.mark.parametrize("allow, expected", [(True, "accept"), (False, "decline")])
 def test_native_codex_permission_is_explicit_and_once_only(tmp_path, allow, expected):
     async def answer(questions):
