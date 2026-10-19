@@ -4,7 +4,9 @@ param(
     [string]$Action,
 
     [Parameter(Mandatory = $true)]
-    [string]$ProjectRoot
+    [string]$ProjectRoot,
+
+    [switch]$LibraryOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -164,6 +166,72 @@ function Assert-RecordIdentity($record, [int]$CurrentListenerProcessId) {
     return [pscustomobject]@{ Launcher = $launcher; Listener = $listener }
 }
 
+function Test-ExactProcessIdentity($Current, $Expected) {
+    if ($null -eq $Current -or $null -eq $Expected) {
+        return $false
+    }
+    return [int]$Current.ProcessId -eq [int]$Expected.ProcessId -and
+        [int]$Current.ParentProcessId -eq [int]$Expected.ParentProcessId -and
+        [string]$Current.CreationDate -eq [string]$Expected.CreationDate -and
+        (Test-SamePath ([string]$Current.ExecutablePath) ([string]$Expected.ExecutablePath)) -and
+        [string]::Equals(
+            [string]$Current.CommandLine,
+            [string]$Expected.CommandLine,
+            [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Stop-FailedStartProcessTree($ExpectedLauncherIdentity) {
+    $result = [ordered]@{
+        LauncherStopped = $false
+        ListenerStopped = $false
+    }
+    $launcher = if ($null -ne $ExpectedLauncherIdentity) {
+        Get-ProcessIdentity ([int]$ExpectedLauncherIdentity.ProcessId)
+    }
+    else {
+        $null
+    }
+    if (-not (Test-ExactProcessIdentity $launcher $ExpectedLauncherIdentity) -or
+        -not (Test-SamePath $launcher.ExecutablePath $PythonPath) -or
+        -not (Test-CommandIdentity $launcher.CommandLine)) {
+        return [pscustomobject]$result
+    }
+
+    try {
+        $listenerProcessId = Get-ListenerProcessId
+    }
+    catch {
+        $listenerProcessId = $null
+    }
+    if ($null -ne $listenerProcessId -and $listenerProcessId -ne $launcher.ProcessId) {
+        $listener = Get-ProcessIdentity $listenerProcessId
+        if ($null -ne $listener -and
+            $listener.ParentProcessId -eq $launcher.ProcessId -and
+            (Test-CommandIdentity $listener.CommandLine)) {
+            try {
+                Stop-Process -Id $listener.ProcessId -ErrorAction Stop
+                $result.ListenerStopped = $true
+            }
+            catch {
+                return [pscustomobject]$result
+            }
+        }
+    }
+
+    $launcher = Get-ProcessIdentity ([int]$ExpectedLauncherIdentity.ProcessId)
+    if (-not (Test-ExactProcessIdentity $launcher $ExpectedLauncherIdentity)) {
+        return [pscustomobject]$result
+    }
+    try {
+        Stop-Process -Id $launcher.ProcessId -ErrorAction Stop
+        $result.LauncherStopped = $true
+    }
+    catch {
+        return [pscustomobject]$result
+    }
+    return [pscustomobject]$result
+}
+
 function Start-Easel {
     if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
         Fail "Project venv Python is missing at .venv\Scripts\python.exe."
@@ -204,6 +272,18 @@ function Start-Easel {
         -WorkingDirectory $ProjectRoot -RedirectStandardOutput $StdoutPath `
         -RedirectStandardError $StderrPath -WindowStyle Hidden -PassThru
 
+    $spawnedLauncherIdentity = $null
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $spawnedLauncherIdentity = Get-ProcessIdentity $launcherProcess.Id
+        if ($null -ne $spawnedLauncherIdentity) {
+            break
+        }
+        if ($launcherProcess.HasExited) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
     $readiness = $null
     $listenerProcessId = $null
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
@@ -220,7 +300,8 @@ function Start-Easel {
         }
     }
     if ($null -eq $listenerProcessId -or $null -eq $readiness) {
-        Fail 'Easel did not become ready within 30 seconds. Review the private outputs/_launcher logs.'
+        $cleanup = Stop-FailedStartProcessTree $spawnedLauncherIdentity
+        Fail "Easel did not become ready within 30 seconds. Failed-start cleanup: launcher=$($cleanup.LauncherStopped), listener=$($cleanup.ListenerStopped). Review the private outputs/_launcher logs."
     }
 
     $launcherIdentity = Get-ProcessIdentity $launcherProcess.Id
@@ -230,7 +311,8 @@ function Start-Easel {
         -not (Test-SamePath $launcherIdentity.ExecutablePath $PythonPath) -or
         -not (Test-CommandIdentity $launcherIdentity.CommandLine) -or
         -not (Test-CommandIdentity $listenerIdentity.CommandLine)) {
-        Fail 'HTTP became ready, but exact launcher/listener ownership could not be proven.'
+        $cleanup = Stop-FailedStartProcessTree $spawnedLauncherIdentity
+        Fail "HTTP became ready, but exact launcher/listener ownership could not be proven. Failed-start cleanup: launcher=$($cleanup.LauncherStopped), listener=$($cleanup.ListenerStopped)."
     }
 
     $record = [ordered]@{
@@ -299,6 +381,10 @@ function Stop-Easel {
     }
     Remove-Item -LiteralPath $RecordPath -Force
     Write-Status 'Stopped the verified Easel 7860 process tree. No other listener was touched.'
+}
+
+if ($LibraryOnly) {
+    return
 }
 
 try {
