@@ -946,7 +946,7 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
 
 def _agent_thinking_level() -> str:
     try:
-        data = json.loads(_oc_config_path().read_text(encoding="utf-8"))
+        data = json.loads(_oc_config_path().read_text(encoding="utf-8-sig"))
         agents = data.get("agents", {})
         reference = agents.get("defaults", {}).get("model", {})
         for agent in agents.get("list", []):
@@ -1560,7 +1560,7 @@ def _model_channels(runtime: str | None = None) -> dict:
     try:
         oc = _oc_config_path()
         if not direct and oc.is_file():
-            primary = str(json.loads(oc.read_text(encoding="utf-8"))
+            primary = str(json.loads(oc.read_text(encoding="utf-8-sig"))
                           .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
     except Exception:  # noqa: BLE001
         pass
@@ -1639,7 +1639,7 @@ def _model_channels(runtime: str | None = None) -> dict:
     try:
         oc = _oc_config_path()
         if not direct and oc.is_file():
-            provs = (json.loads(oc.read_text(encoding="utf-8"))
+            provs = (json.loads(oc.read_text(encoding="utf-8-sig"))
                      .get("models", {}).get("providers", {})) or {}
             for pkey, pv in provs.items():
                 if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
@@ -1861,7 +1861,7 @@ def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
     """读 openclaw.json 里每个 chat 供应商现存的 (baseUrl, apiKey)。读不到就当空表（不阻断保存）。"""
     try:
         oc = _oc_config_path()
-        provs = json.loads(oc.read_text(encoding='utf-8')).get('models', {}).get('providers', {})
+        provs = json.loads(oc.read_text(encoding='utf-8-sig')).get('models', {}).get('providers', {})
         return {k: (str(v.get('baseUrl') or ''), str(v.get('apiKey') or ''))
                 for k, v in provs.items() if isinstance(v, dict)}
     except Exception:  # noqa: BLE001
@@ -1878,7 +1878,7 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         changed = False
         for pkey in [k for k in list(providers.keys())
@@ -1969,7 +1969,7 @@ def _sync_anthropic_provider(base: str, key: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return ''
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         target_base = base or 'https://api.anthropic.com'
@@ -2351,7 +2351,7 @@ def _set_openclaw_primary(primary_ref: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
         if ref.get('primary') == primary_ref:
             return ''
@@ -2375,7 +2375,7 @@ def _declare_anthropic_provider(base: str) -> str:
         oc = _oc_config_path()
         if not oc.is_file():
             return 'openclaw.json 不存在，请先运行 bash setup.sh'
-        data = json.loads(oc.read_text(encoding='utf-8'))
+        data = json.loads(oc.read_text(encoding='utf-8-sig'))
         providers = data.setdefault('models', {}).setdefault('providers', {})
         prov = providers.get('anthropic')
         if isinstance(prov, dict) and prov.get('baseUrl') == base:
