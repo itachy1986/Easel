@@ -80,7 +80,7 @@ def _ask_openclaw() -> Path | None:
 def _from_config() -> Path | None:
     """openclaw.json 里显式写死的 workspace（用户/旧版 setup 设过就以它为准）。"""
     try:
-        cfg = json.loads(config_path().read_text(encoding="utf-8"))
+        cfg = json.loads(config_path().read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     agents = cfg.get("agents") or {}
