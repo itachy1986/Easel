@@ -1,6 +1,14 @@
+import importlib.util
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
-from tests import publish_browser_fixture as fixture
+
+fixture_path = Path(__file__).with_name('publish_browser_fixture.py')
+fixture_spec = importlib.util.spec_from_file_location('issue38_publish_browser_fixture', fixture_path)
+assert fixture_spec is not None and fixture_spec.loader is not None
+fixture = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(fixture)
 
 
 client = TestClient(fixture.app)
