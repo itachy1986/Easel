@@ -13,3 +13,35 @@
   color: var(--text);
 }
 .publish-handoff::backdrop { background: rgb(0 0 0 / 45%); }
+
+/* Publishing controls are always visible, independent of message hover. */
+.publish-draft-actions, .code-block-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  opacity: 1;
+  margin: 12px 0;
+}
+.publish-draft-actions .btn, .code-block-actions .btn {
+  white-space: normal;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.publish-draft-actions .btn-primary,
+.publish-draft-actions .btn-primary:hover:not(:disabled) {
+  background: #2855b7;
+  color: #fff;
+}
+.publish-draft-actions .btn:focus-visible, .code-block-actions .btn:focus-visible {
+  outline: 3px solid var(--text);
+  outline-offset: 3px;
+}
+.copyable-code-block { min-width: 0; max-width: 100%; }
+.code-block-actions { font-family: inherit; font-size: 13px; }
+.code-block-actions [hidden] { display: none; }
+.message-bubble.assistant .copyable-code-block pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.publish-handoff details pre { overflow-wrap: anywhere; }

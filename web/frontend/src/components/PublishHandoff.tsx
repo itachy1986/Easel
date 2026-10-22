@@ -35,7 +35,7 @@ export default function PublishHandoff({ text, sourceId, onClose, onImported }: 
     <details><summary>核对回复原文</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{text}</pre></details>
     {existing && <p role="status">已有未完成草稿：可保留旧稿另存，或明确覆盖当前草稿。</p>}
     {error && <p role="alert">{error}</p>}
-    <div className="msg-actions">
+    <div className="publish-draft-actions">
       <button className="btn" onClick={onClose}>取消</button>
       {existing && <button className="btn" onClick={() => accept('replace')}>覆盖当前草稿</button>}
       <button className="btn btn-primary" onClick={() => accept('new')}>{existing ? '保留旧稿，另存新稿' : '保存草稿并前往'}</button>
