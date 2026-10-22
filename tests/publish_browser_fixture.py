@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from web import app as web
 
 ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_DIST = ROOT / 'web/frontend/dist'
 is_isolated_worktree = (ROOT / '.git').is_file()
 is_github_actions_runner = os.environ.get('GITHUB_ACTIONS') == 'true'
 if not (is_isolated_worktree or is_github_actions_runner):
@@ -144,7 +145,9 @@ def page():
       localStorage.setItem('easel_publish_draft', {json.dumps(old_draft)});
     }}
     </script><script defer src='/smoke.js'></script>"""
-    return HTMLResponse((ROOT / 'web/frontend/dist/index.html').read_text(encoding='utf-8').replace('<head>', '<head>' + script))
+    index_path = FRONTEND_DIST / 'index.html'
+    index_html = index_path.read_text(encoding='utf-8') if index_path.is_file() else '<html><head></head><body></body></html>'
+    return HTMLResponse(index_html.replace('<head>', '<head>' + script))
 
 
 @app.get('/smoke.js')
@@ -153,7 +156,7 @@ def smoke_script():
     return Response((ROOT / 'tests/publish_browser_smoke.js').read_text(encoding='utf-8'), media_type='text/javascript')
 
 
-app.mount('/assets', StaticFiles(directory=ROOT / 'web/frontend/dist/assets'), name='assets')
+app.mount('/assets', StaticFiles(directory=FRONTEND_DIST / 'assets', check_dir=False), name='assets')
 
 if __name__ == '__main__':
     import uvicorn
