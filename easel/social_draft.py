@@ -6,6 +6,8 @@ import re
 def social_draft_instruction(message: str) -> str:
     if not re.search(r"小红书|微信公众号|公众号", message):
         return ""
+    if re.match(r"^\s*(?:(?:请|麻烦)(?:帮我)?|帮我|帮忙)?\s*(?:修复|调试|排查|定位|解决|诊断|检查)", message):
+        return ""
     # Judge the user's requested action, not the article topic: "write about fixing code"
     # is creation, while "debug the publishing API" is product diagnosis.
     if not re.search(r"写|创作|生成|改编|润色|(?:优化(?:这篇|文案|文章|帖子|笔记))", message):

@@ -43,8 +43,11 @@ export function normalizeLocalMediaReference(input: string): string | null {
 
 function mediaReferences(text: string): string[] {
   const candidates: string[] = [];
-  for (const match of text.matchAll(/!?\[[^\]]*\]\((?:<([^>]+)>|([^)\n]+))\)/g)) candidates.push(match[1] || match[2]);
-  for (const match of text.matchAll(/(?:\/api\/media\/|outputs[\\/])[^\s)\]<>"']+\.(?:png|jpe?g|webp|gif|bmp|avif|mp4|mov|webm)/gi)) candidates.push(match[0]);
+  const withoutLinks = text.replace(/!?\[[^\]]*\]\((?:<([^>]+)>|([^)\n]+))\)/g, (_whole, angled, plain) => {
+    candidates.push(angled || plain);
+    return ' ';
+  });
+  for (const match of withoutLinks.matchAll(/(?:^|\s)((?:\/api\/media\/|outputs[\\/])[^\s)\]<>"']+\.(?:png|jpe?g|webp|gif|bmp|avif|mp4|mov|webm))/gim)) candidates.push(match[1]);
   return [...new Set(candidates.map(normalizeLocalMediaReference).filter((path): path is string => Boolean(path)))];
 }
 
@@ -54,6 +57,7 @@ export function parsePublishReply(text: string, platform: string, sourceId: stri
   const buckets: Record<PlatformScope, Record<Section, string[]>> = {
     global: emptySections(), xiaohongshu: emptySections(), 'wechat-oa': emptySections(),
   };
+  const mediaBuckets: Record<PlatformScope, string[]> = { global: [], xiaohongshu: [], 'wechat-oa': [] };
   const warnings: string[] = [];
   const seenScopes = new Set<PlatformScope>();
   let scope: PlatformScope = 'global';
@@ -67,14 +71,17 @@ export function parsePublishReply(text: string, platform: string, sourceId: stri
     const match = heading.match(/^(?:(小红书|微信公众号|公众号)\s*)?(标题|发布正文|正文|发布文案|话题标签|标签|(?:Nano Banana(?:\s*\/\s*Google Flow)?|Google Flow(?:\s*\/\s*Nano Banana)?|Google Flow|Flow)\s*(?:生图|配图)?提示词|配图提示词(?:（(?:[^）]*)）)?)\s*(?:[：:]\s*(.*)|$)/i);
     const visiblyAHeading = /^(?:#{1,6}\s*|\d+[.、)]\s*|\*\*)/.test(line.trim())
       || /[：:]/.test(heading)
-      || /^(?:标题|发布正文|正文|发布文案|话题标签|标签)$/.test(heading);
+      || (Boolean(match) && !match?.[1] && match?.[3] === undefined && line.trim() === heading);
     if (match && visiblyAHeading) {
       const targetScope = (match[1] ? scopeFor(match[1]) : null) || scope;
       seenScopes.add(targetScope);
       const label = match[2];
       section = /提示词/i.test(label) ? 'flow' : /标题/.test(label) ? 'title' : /标签/.test(label) ? 'tags' : 'body';
       scope = targetScope;
-      if (match[3]) buckets[scope][section].push(match[3]);
+      if (match[3]) {
+        buckets[scope][section].push(match[3]);
+        mediaBuckets[scope].push(...mediaReferences(match[3]));
+      }
       continue;
     }
     if (/提示词/.test(heading) && /^(?:#{1,6}|\s*\d+[.、)]|\*\*)/.test(line.trim())) {
@@ -84,6 +91,7 @@ export function parsePublishReply(text: string, platform: string, sourceId: stri
       continue;
     }
     buckets[scope][section].push(line);
+    mediaBuckets[scope].push(...mediaReferences(line));
   }
   const desired: PlatformScope = platform === 'wechat-oa' ? 'wechat-oa' : 'xiaohongshu';
   const selected = seenScopes.has(desired) ? buckets[desired] : buckets.global;
@@ -93,12 +101,16 @@ export function parsePublishReply(text: string, platform: string, sourceId: stri
   const value = (key: Section) => (selected[key].length ? selected[key] : buckets.global[key]).join('\n').trim();
   const body = selected.body.length || buckets.global.body.length ? value('body') : value('unstructured');
   const flowPrompt = value('flow');
+  const media = [...new Set([
+    ...mediaBuckets.global,
+    ...(seenScopes.has(desired) ? mediaBuckets[desired] : []),
+  ])];
   return {
     version: 2, id: `draft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     sourceId, originalResponse: text, title: value('title'), body,
     tags: value('tags').split(/[\s,，]+/).map(tag => tag.replace(/^#/, '')).filter(Boolean).join(','),
     platforms: [platform], overrides: {}, flowPrompt,
     aspectRatio: flowPrompt.match(/(?:比例|画幅)\s*[：:]?\s*(\d+\s*[:：]\s*\d+)/)?.[1].replace(/\s/g, '').replace('：', ':') || '3:4',
-    media: mediaReferences(text), parseWarnings: [...new Set(warnings)],
+    media, parseWarnings: [...new Set(warnings)],
   };
 }

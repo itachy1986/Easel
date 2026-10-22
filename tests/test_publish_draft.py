@@ -15,6 +15,8 @@ def test_social_prompt_only_for_explicit_creation():
     assert 'Nano Banana' in chat_turn_message('写一篇关于用 AI 修复代码的小红书笔记', None)
     assert 'Nano Banana' in chat_turn_message('给公众号写一篇介绍 API 接口设计的文章', None)
     assert 'Nano Banana' not in chat_turn_message('排查公众号发布接口报错', None)
+    assert 'Nano Banana' not in chat_turn_message('修复小红书生成文案按钮的报错', None)
+    assert 'Nano Banana' not in chat_turn_message('调试公众号文章生成接口，为什么返回500', None)
 
 
 @pytest.fixture

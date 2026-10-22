@@ -5,6 +5,7 @@ Open http://127.0.0.1:8765 in the approved built-in browser. Evidence: /evidence
 Only synthetic fixtures in this checkout's .smoke-issue38 directory are used.
 """
 import json
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -24,6 +25,8 @@ app = FastAPI()
 events = []
 network = []
 policy_mode = 'manual'
+run_id = ''
+required_steps = {'chat-to-draft', 'image-upload', 'refresh-preview', 'manual-export', 'automatic-preview'}
 allowed = {'/api/publish-draft/images', '/api/manual-publish/{platform}/export', '/api/media/{path:path}', '/api/outputs'}
 for route in web.app.routes:
     if getattr(route, 'path', '') in allowed:
@@ -50,29 +53,59 @@ def set_policy(mode: str):
     return {'ok': True, 'mode': mode}
 
 
+@app.post('/fixture/run')
+def start_run():
+    global policy_mode, run_id
+    events.clear()
+    network.clear()
+    policy_mode = 'manual'
+    run_id = uuid.uuid4().hex[:12]
+    return {'ok': True, 'runId': run_id, 'mode': policy_mode}
+
+
 @app.get('/fixture/assertions')
 def assertions():
     forbidden = [entry for entry in network if entry.startswith('POST /api/publish/') or entry == 'POST /api/chat']
-    return {'ok': not forbidden, 'forbidden': forbidden}
+    return {'ok': not forbidden, 'forbidden': forbidden, 'runId': run_id}
+
+
+@app.get('/fixture/result')
+def result():
+    succeeded = {event.get('step') for event in events if event.get('ok') is True}
+    failures = [event for event in events if event.get('ok') is not True]
+    boundary = assertions()
+    missing = sorted(required_steps - succeeded)
+    return {
+        'ok': bool(run_id) and not missing and not failures and boundary['ok'],
+        'runId': run_id, 'missing': missing, 'failures': failures,
+        'forbidden': boundary['forbidden'],
+    }
 
 
 @app.post('/evidence')
 async def evidence(request: Request):
-    events.append(await request.json())
+    payload = await request.json()
+    if (not isinstance(payload, dict) or not isinstance(payload.get('step'), str)
+            or not isinstance(payload.get('ok'), bool)
+            or ('detail' in payload and not isinstance(payload['detail'], str))):
+        return JSONResponse({'detail': 'invalid evidence event'}, status_code=400)
+    events.append({**payload, 'runId': run_id})
     return {'ok': True}
 
 
 @app.get('/evidence')
 def report():
-    return {'events': events, 'network': network}
+    return {'runId': run_id, 'events': events, 'network': network, 'result': result()}
 
 
 @app.get('/api/{path:path}')
 def mock_get(path: str):
     if path == 'status':
         return {'gateway': 'running', 'apiDirect': True, 'modelConfigured': True}
-    if path in {'personas', 'skills', 'schedules', 'sessions', 'ideas'}:
+    if path in {'personas', 'skills', 'schedule', 'sessions', 'ideas', 'accounts', 'analytics/platforms'}:
         return []
+    if path == 'trends':
+        return {'trends': [], 'updated': 0}
     return {}
 
 
@@ -88,12 +121,24 @@ def page():
         {'role': 'assistant', 'content': '## 标题\n春日茶园\n## 正文\n在茶园散步。\n## 话题标签\n#春天 #茶园\n## Nano Banana 生图提示词\n茶园晨光，绿色，三分构图，顶部留白。',
          'thinking': 'INTERNAL_NOT_FOR_PUBLISH', 'activity': 'TOOL_NOT_FOR_PUBLISH'},
     ]}], ensure_ascii=False)
+    old_draft = json.dumps({
+        'version': 2, 'id': 'smoke-old-draft', 'title': '旧稿', 'body': '保留的旧正文',
+        'tags': '', 'platforms': ['xiaohongshu'], 'overrides': {}, 'media': [],
+        'flowPrompt': '', 'aspectRatio': '3:4',
+    }, ensure_ascii=False)
     script = f"""<script>
+    const requestedRun = new URLSearchParams(location.search).get('run') || 'default';
+    if (sessionStorage.getItem('smoke-run-request') !== requestedRun) {{
+      sessionStorage.setItem('smoke-run-request', requestedRun);
+      sessionStorage.removeItem('smoke-stage');
+      sessionStorage.removeItem('smoke-run-id');
+    }}
     if (!sessionStorage.getItem('smoke-stage')) {{
       localStorage.setItem('easel_sessions', {json.dumps(seed)});
       localStorage.setItem('easel_active_session', 'smoke-chat');
       localStorage.setItem('easel_onboarding_seen', '1');
       sessionStorage.setItem('easel_tab_session', 'smoke-chat');
+      localStorage.setItem('easel_publish_draft', {json.dumps(old_draft)});
     }}
     </script><script defer src='/smoke.js'></script>"""
     return HTMLResponse((ROOT / 'web/frontend/dist/index.html').read_text(encoding='utf-8').replace('<head>', '<head>' + script))

@@ -38,6 +38,16 @@ test('numbered Markdown and the actual Nano Banana / Google Flow heading stay ou
   assert.equal(d.aspectRatio, '16:9');
 });
 
+test('plain Flow heading is isolated from publish body', () => {
+  const h = load('publishHandoff');
+  const raw = '标题\n茶园\n正文\n只有正文。\nNano Banana 生图提示词\n不要进入正文的生图说明。';
+  const d = h.parsePublishReply(raw, 'xiaohongshu', 's:plain-flow');
+  assert.equal(d.title, '茶园');
+  assert.equal(d.body, '只有正文。');
+  assert.equal(d.flowPrompt, '不要进入正文的生图说明。');
+  assert.deepEqual(Array.from(d.parseWarnings), []);
+});
+
 test('multi-platform response selects only the requested platform block', () => {
   const h = load('publishHandoff');
   const raw = '## 小红书\n### 标题\n小红书标题\n### 正文\n小红书正文\n## 公众号\n### 标题\n公众号标题\n### 正文\n公众号正文';
@@ -68,6 +78,19 @@ test('local media references decode once and remain protected', () => {
   const h = load('publishHandoff');
   const d = h.parsePublishReply('![封面](outputs/茶园/封面%201.png)\n![Win](C:\\Easel\\outputs\\茶园\\封面%202.png)\n![拒绝](outputs/../secret.png)\n![私有](outputs/_inbox/a.png)', 'xiaohongshu', 's:6');
   assert.deepEqual(Array.from(d.media), ['茶园/封面 1.png', '茶园/封面 2.png']);
+});
+
+test('media follows the selected platform block and retains only global shared media', () => {
+  const h = load('publishHandoff');
+  const raw = '![共用](outputs/shared/logo.png)\n## 小红书\n### 正文\n小红书正文\n![小红书图](outputs/xhs/cover.png)\n## 公众号\n### 正文\n公众号正文\n![公众号图](outputs/wechat/cover.png)';
+  const d = h.parsePublishReply(raw, 'wechat-oa', 's:scoped-media');
+  assert.deepEqual(Array.from(d.media), ['shared/logo.png', 'wechat/cover.png']);
+});
+
+test('external URLs containing outputs are never rescanned as local media', () => {
+  const h = load('publishHandoff');
+  const d = h.parsePublishReply('![外部](https://example.com/outputs/private-project/cover.png)', 'xiaohongshu', 's:external-media');
+  assert.deepEqual(Array.from(d.media), []);
 });
 test('legacy draft migrates; cancel is nonmutating; save-new preserves previous; stale writes rejected', () => {
   const s = load('store', { easel_publish_draft: JSON.stringify({ title:'旧稿', body:'原文', tags:'茶', platforms:['wechat-oa'] }) });
