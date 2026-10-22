@@ -82,3 +82,19 @@ test('PublishPage only marks itself dead from the unmount cleanup', () => {
   assert.ok(cleanupStatements.some(statement => statement.getText(parsed).includes('pollTimers.current.clear()')),
     'unmount cleanup must clear publish status polling timers');
 });
+
+test('PublishPage binds preflight, confirmation, and submit to one immutable draft snapshot', () => {
+  const statements = findCallbackStatements('publishAll');
+  const implementation = statements.map(statement => statement.getText(parsed)).join('\n');
+
+  assert.match(implementation, /capturePublishSnapshot\(draft, persona\)/,
+    'publish must capture the exact draft and persona before any asynchronous step');
+  assert.match(implementation, /runGuardedPublish/,
+    'publish must guard preflight, confirmation, and submission with the same operation');
+  assert.match(implementation, /publishConfirmationMessage\(snapshot/,
+    'confirmation must identify the captured draft rather than the currently rendered draft');
+  assert.match(implementation, /publishNow\(target\.key,\s*\{[\s\S]*title: snapshot\.title/,
+    'submission payload must use the captured snapshot');
+  assert.match(implementation, /if \(!stillCurrent\(\)\) return;/,
+    'submission must revalidate the operation before external I/O');
+});

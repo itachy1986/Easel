@@ -2650,7 +2650,11 @@ def _direct_chat_content(req: ChatRequest) -> tuple[str | list, str]:
     message = req.message.strip()
     if not message and not req.attachments:
         raise HTTPException(400, "消息不能为空")
+    from easel.social_draft import social_draft_instruction
     system = SYSTEM_PROMPT
+    guidance = social_draft_instruction(message)
+    if guidance:
+        system += "\n\n" + guidance
     if req.persona:
         if not _valid_persona_name(req.persona) or not profile_exists(req.persona):
             raise HTTPException(400, "画像不存在或名称无效")
@@ -4200,6 +4204,59 @@ async def api_upload(
     if not saved:
         raise HTTPException(400, '没有文件')
     return {"ok": True, "files": saved}
+
+
+@app.post("/api/publish-draft/images")
+async def api_publish_draft_images(
+    files: list[UploadFile] = File(...),
+    draftId: str = Form(...),
+):
+    """Import only explicitly uploaded images, retaining their private inbox originals."""
+    import re
+    import warnings
+    from PIL import Image, UnidentifiedImageError
+
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,100}", draftId):
+        raise HTTPException(400, "无效的草稿标识")
+    if not 1 <= len(files) <= 9:
+        raise HTTPException(400, "每次请选择 1–9 张图片")
+    formats = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
+    if any(Path(f.filename or "").suffix.lower() not in formats for f in files):
+        raise HTTPException(400, "仅支持 PNG、JPEG、WebP 图片")
+    scope = _attachment_scope(draftId)
+    # Resolve both roots before upload/copy; a pre-existing junction must not escape outputs.
+    _safe_output_target(f"_inbox/{scope}", must_exist=False)
+    destination = _safe_output_target(f"draft-media/{scope}/{uuid.uuid4().hex}", must_exist=False)
+    uploaded = await api_upload(files=files, sessionId=draftId)
+    refs = [AttachmentRef(**item) for item in uploaded["files"]]
+    _attachment_context(ChatRequest(message="", sessionId=draftId, attachments=refs))
+    validated = []
+    for ref in refs:
+        source = _safe_output_target(ref.path)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(source) as img:
+                    if img.format != formats[source.suffix.lower()] or img.width * img.height > 40_000_000:
+                        raise ValueError("invalid image")
+                    img.verify()
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise HTTPException(400, "图片无效或尺寸过大，请重新导出为 PNG/JPEG/WebP") from None
+        validated.append(source)
+    created: list[Path] = []
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+        for index, source in enumerate(validated):
+            target = destination / f"image-{index + 1}{source.suffix.lower()}"
+            created.append(target)
+            shutil.copyfile(source, target)
+    except OSError:
+        for target in created:
+            target.unlink(missing_ok=True)
+        if destination.exists():
+            destination.rmdir()
+        raise HTTPException(500, "图片导入失败，草稿未更改，请重试") from None
+    return {"ok": True, "media": [p.relative_to(OUTPUTS_DIR.resolve()).as_posix() for p in created]}
 
 
 @app.get("/api/upload/limits")

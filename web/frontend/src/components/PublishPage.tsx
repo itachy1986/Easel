@@ -4,7 +4,11 @@ import {
   fetchAccounts, publishNow, publishStatus, submitPublishSms, fetchOutputs, mediaUrl,
 } from '../lib/api';
 import type { AccountItem, OutputFile } from '../lib/api';
-import { loadPublishDraft, savePublishDraft } from '../lib/store';
+import { usePublishDraft } from '../lib/usePublishDraft';
+import { loadPublishDraft } from '../lib/store';
+import { capturePublishSnapshot, publishConfirmationMessage, publishSnapshotKey, runGuardedPublish } from '../lib/publishOperation';
+import type { PublishSnapshot } from '../lib/publishOperation';
+import FlowDraftPanel from './FlowDraftPanel';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconPublish, IconCopy, IconCheck, IconCalendar, IconSkills, IconEdit, IconStop, IconTrash } from './icons';
 
@@ -42,12 +46,10 @@ function parseSections(text: string): Record<string, string> {
 type PubState = { status: 'publishing' | 'ok' | 'fail'; msg: string };
 
 export default function PublishPage({ persona }: PublishPageProps) {
-  const draft0 = loadPublishDraft();
-  const [title, setTitle] = useState(draft0.title);
-  const [body, setBody] = useState(draft0.body);
-  const [platforms, setPlatforms] = useState<string[]>(draft0.platforms);
-  const [overrides, setOverrides] = useState<Record<string, string>>(draft0.overrides);
-  const [tags, setTags] = useState(draft0.tags || '');
+  const { draft, field, saveError } = usePublishDraft();
+  const { title, body, platforms, overrides, tags } = draft;
+  const setTitle = field('title'), setBody = field('body'), setPlatforms = field('platforms');
+  const setOverrides = field('overrides'), setTags = field('tags');
   const [editing, setEditing] = useState<string | null>(null);
   const [copied, setCopied] = useState('');
   const [toast, setToast] = useState('');
@@ -58,11 +60,13 @@ export default function PublishPage({ persona }: PublishPageProps) {
   // 异步发布轮询的 interval 集合：离开页面统一清掉，否则最长还会继续转 15 分钟
   const pollTimers = useRef<Set<ReturnType<typeof setInterval>>>(new Set());
   const aliveRef = useRef(true);
+  const publishOperationRef = useRef(0);
 
   // 发布相关
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [mediaFiles, setMediaFiles] = useState<OutputFile[]>([]);
-  const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
+  const selectedMedia = draft.media || [];
+  const setSelectedMedia = (update: (old: string[]) => string[]) => field('media')(old => update(old || []));
   const [showPicker, setShowPicker] = useState(false);
   const [pub, setPub] = useState<Record<string, PubState>>({});
   const [publishing, setPublishing] = useState(false);
@@ -71,14 +75,11 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const [pubSmsCode, setPubSmsCode] = useState('');
   const [pubSmsBusy, setPubSmsBusy] = useState(false);
 
-  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在
-  useEffect(() => {
-    savePublishDraft({ title, body, platforms, overrides, tags });
-  }, [title, body, platforms, overrides, tags]);
 
   const cleanupPublishActivity = useCallback(() => {
     // 卸载：中止流 + 停掉所有发布状态轮询（否则在后台空转最长 15 分钟）
     aliveRef.current = false;
+    publishOperationRef.current += 1;
     adaptCtl.current?.abort();
     pollTimers.current.forEach((iv) => clearInterval(iv));
     pollTimers.current.clear();
@@ -88,6 +89,13 @@ export default function PublishPage({ persona }: PublishPageProps) {
     aliveRef.current = true;
     return cleanupPublishActivity;
   }, [cleanupPublishActivity]);
+
+  const renderedSnapshotKey = publishSnapshotKey(capturePublishSnapshot(draft, persona));
+  useEffect(() => {
+    publishOperationRef.current += 1;
+    setChecking(false);
+    setPublishing(false);
+  }, [renderedSnapshotKey]);
 
   // 登录态 + 可选媒体列表
   useEffect(() => {
@@ -162,16 +170,16 @@ export default function PublishPage({ persona }: PublishPageProps) {
   };
   const stopAdapt = () => { adaptCtl.current?.abort(); setAdapting(false); };
 
-  const performPrecheck = async () => {
+  const performPrecheck = async (snapshot: PublishSnapshot) => {
     const prompt =
       `你是社媒发布审核助手。针对下面这条待发内容做两项检查，用简洁中文分点输出：\n` +
       `1. **合规风险**：是否含极限词/医疗功效/敏感或违规表述，列出问题词+替换建议；无则写"未见明显风险"。\n` +
       `2. **标题/钩子**：给标题打 1-10 分，并给 1-2 个更好的备选。\n` +
-      `最后一行给「✅可发 / ⚠️建议修改」结论。\n\n待检内容：\n标题：${title}\n正文：${body}`;
-    const content = `待发布内容：\n标题：${title}\n正文：${body}`;
+      `最后一行给「✅可发 / ⚠️建议修改」结论。\n\n待检内容：\n标题：${snapshot.title}\n正文：${snapshot.body}`;
+    const content = `待发布内容：\n标题：${snapshot.title}\n正文：${snapshot.body}`;
     const [general, personaResult] = await Promise.all([
       runAgent(prompt),
-      persona ? executeSkill('persona-check', content, persona) : Promise.resolve(null),
+      snapshot.persona ? executeSkill('persona-check', content, snapshot.persona) : Promise.resolve(null),
     ]);
     return `${general.response}\n\n---\n\n## 人设一致性\n\n${personaResult?.response || '未选择画像，已跳过人设一致性检查。'}`;
   };
@@ -179,70 +187,101 @@ export default function PublishPage({ persona }: PublishPageProps) {
   // C. 发布前一键预检
   const check = async () => {
     if (empty) return;
+    const snapshot = capturePublishSnapshot(draft, persona);
+    const snapshotKey = publishSnapshotKey(snapshot);
+    const operation = ++publishOperationRef.current;
+    const isCurrent = () => aliveRef.current && operation === publishOperationRef.current
+      && publishSnapshotKey(capturePublishSnapshot(loadPublishDraft(), persona)) === snapshotKey;
     setChecking(true); setCheckResult('');
     try {
-      setCheckResult(await performPrecheck());
+      const result = await performPrecheck(snapshot);
+      if (isCurrent()) setCheckResult(result);
     } catch (e) {
-      setCheckResult(e instanceof Error ? e.message : '预检失败');
-    } finally { setChecking(false); }
+      if (isCurrent()) setCheckResult(e instanceof Error ? e.message : '预检失败');
+    } finally {
+      if (aliveRef.current && operation === publishOperationRef.current) setChecking(false);
+    }
   };
 
   // D. 一键发布（真发布，二次确认）
   const publishAll = async () => {
     if (empty || publishing || checking) return;
-    const targets = PLATFORMS.filter((p) => platforms.includes(p.key) && PUBLISHABLE.has(p.key));
+    const snapshot = capturePublishSnapshot(draft, persona);
+    const snapshotKey = publishSnapshotKey(snapshot);
+    const operation = ++publishOperationRef.current;
+    const isCurrent = () => aliveRef.current && operation === publishOperationRef.current
+      && publishSnapshotKey(capturePublishSnapshot(loadPublishDraft(), persona)) === snapshotKey;
+    const targets = PLATFORMS.filter((p) => snapshot.platforms.includes(p.key) && PUBLISHABLE.has(p.key));
     if (targets.length === 0) {
       showToast('所选平台暂不支持一键发布（B站请用「复制」或终端 biliup）');
       return;
     }
     setChecking(true);
     try {
-      setCheckResult(await performPrecheck());
-    } catch (e) {
-      setCheckResult(`预检失败：${e instanceof Error ? e.message : '未知错误'}\n\n预检仅用于提醒，不会阻止你继续发布。`);
+      await runGuardedPublish({
+        isCurrent,
+        precheck: async () => {
+          try {
+            const result = await performPrecheck(snapshot);
+            if (isCurrent()) setCheckResult(result);
+          } catch (error) {
+            if (isCurrent()) setCheckResult(`预检失败：${error instanceof Error ? error.message : '未知错误'}\n\n预检仅用于提醒，不会阻止你继续发布。`);
+          }
+        },
+        confirm: () => window.confirm(publishConfirmationMessage(snapshot, targets.map(target => target.label))),
+        submit: async (stillCurrent) => {
+          if (!stillCurrent()) return;
+          setPublishing(true);
+          for (const target of targets) {
+            if (!stillCurrent()) return;
+            if (!loginOf(target.key)) {
+              setPub(current => ({ ...current, [target.key]: { status: 'fail', msg: '未登录 · 去账号页登录' } }));
+              continue;
+            }
+            if (MEDIA_REQUIRED.has(target.key) && snapshot.media.length === 0) {
+              setPub(current => ({ ...current, [target.key]: { status: 'fail', msg: '需附带图片/视频' } }));
+              continue;
+            }
+            if (VIDEO_ONLY.has(target.key) && !snapshot.media.some(path => VIDEO_RE.test(path))) {
+              setPub(current => ({ ...current, [target.key]: { status: 'fail', msg: `${target.label}只能发视频，请从内容库选一个视频` } }));
+              continue;
+            }
+            if (!stillCurrent()) return;
+            setPub(current => ({ ...current, [target.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
+            try {
+              const result = await publishNow(target.key, {
+                title: snapshot.title,
+                body: snapshot.overrides[target.key] ?? snapshot.body,
+                media: snapshot.media,
+                tags: snapshot.tags,
+                persona: snapshot.persona,
+              });
+              if (!stillCurrent()) return;
+              if (result.async) {
+                await pollAsyncPublish(target.key, target.label);
+                if (!stillCurrent()) return;
+              } else {
+                setPub(current => ({
+                  ...current,
+                  [target.key]: result.ok
+                    ? { status: 'ok', msg: '已发布 ✅' }
+                    : { status: 'fail', msg: result.detail || result.message || '发布失败' },
+                }));
+              }
+            } catch (error) {
+              if (!stillCurrent()) return;
+              setPub(current => ({ ...current, [target.key]: { status: 'fail', msg: error instanceof Error ? error.message : '发布失败' } }));
+            }
+          }
+          if (stillCurrent()) showToast('发布流程结束，见各平台卡片状态');
+        },
+      });
     } finally {
-      setChecking(false);
-    }
-    const okToSend = window.confirm(
-      `发布前预检已执行，结果已显示在页面中。人设评分只做提醒，不会阻止发布。\n\n` +
-      `即将【真实发布】到：${targets.map((t) => t.label).join('、')}。\n` +
-      `这会公开发布到你的账号，确定继续？`);
-    if (!okToSend) return;
-
-    setPublishing(true);
-    for (const t of targets) {
-      if (!loginOf(t.key)) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '未登录 · 去账号页登录' } }));
-        continue;
-      }
-      if (MEDIA_REQUIRED.has(t.key) && selectedMedia.length === 0) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: '需附带图片/视频' } }));
-        continue;
-      }
-      if (VIDEO_ONLY.has(t.key) && !selectedMedia.some((p) => VIDEO_RE.test(p))) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: `${t.label}只能发视频，请从内容库选一个视频` } }));
-        continue;
-      }
-      setPub((r) => ({ ...r, [t.key]: { status: 'publishing', msg: '发布中…可能需 1-2 分钟' } }));
-      try {
-        const res = await publishNow(t.key, { title, body: effective(t.key), media: selectedMedia, tags, persona });
-        if (res.async) {
-          // 抖音：异步发布，轮询状态；风控触发短信墙时弹输入框（条件触发，没触发就直接跑完）
-          await pollAsyncPublish(t.key, t.label);
-        } else {
-          setPub((r) => ({
-            ...r,
-            [t.key]: res.ok
-              ? { status: 'ok', msg: '已发布 ✅' }
-              : { status: 'fail', msg: res.detail || res.message || '发布失败' },
-          }));
-        }
-      } catch (e) {
-        setPub((r) => ({ ...r, [t.key]: { status: 'fail', msg: e instanceof Error ? e.message : '发布失败' } }));
+      if (aliveRef.current && operation === publishOperationRef.current) {
+        setChecking(false);
+        setPublishing(false);
       }
     }
-    setPublishing(false);
-    showToast('发布流程结束，见各平台卡片状态');
   };
 
   // 异步发布轮询（抖音）：直到 success/error；遇 sms_required/verifying 弹短信窗口
@@ -314,6 +353,9 @@ export default function PublishPage({ persona }: PublishPageProps) {
     <div className="publish-page">
       <div className="publish-editor">
         <h1 className="page-title"><IconPublish size={21} /> 发布中心</h1>
+        {saveError && <p role="alert">{saveError}</p>}
+        <FlowDraftPanel draft={draft} onPrompt={field('flowPrompt')} onRatio={field('aspectRatio')}
+          onMedia={setSelectedMedia} onPick={() => setShowPicker(true)} />
         <p className="page-subtitle">一次编辑 → AI 一键改写成各平台版本 → 预检 → 附媒体 → 一键真发布。</p>
 
         <label className="field-label">标题</label>
@@ -346,7 +388,7 @@ export default function PublishPage({ persona }: PublishPageProps) {
           </button>
           {selectedMedia.map((path) => (
             <div key={path} className="media-chip" onClick={() => toggleMedia(path)} title="点击移除">
-              {mediaFiles.find((f) => f.path === path)?.kind === 'image'
+              {mediaFiles.find((f) => f.path === path)?.kind === 'image' || /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i.test(path)
                 ? <img src={mediaUrl(path)} alt="" /> : <span className="media-vid">🎬</span>}
               <span className="media-x">×</span>
             </div>

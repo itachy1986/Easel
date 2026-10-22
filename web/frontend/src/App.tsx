@@ -714,6 +714,7 @@ export default function App() {
       case 'chat':
         return activeSession ? (
           <ChatPage
+            onPublishNavigate={() => setCurrentPage('publish')}
             apiDirect={apiDirect}
             key={activeSession.id}
             session={activeSession}
