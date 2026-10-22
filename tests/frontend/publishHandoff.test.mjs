@@ -27,6 +27,48 @@ test('visible structured response separates Flow prompt and retains original wit
   assert.equal(h.parsePublishReply('普通回复', 'wechat-oa', 's:2').title, '');
   assert.equal(h.parsePublishReply('普通回复', 'wechat-oa', 's:2').tags, '');
 });
+test('numbered Markdown and the actual Nano Banana / Google Flow heading stay out of body', () => {
+  const h = load('publishHandoff');
+  const raw = '## 1. 标题\n技术茶园\n## 2. 正文\n只保留正文。\n## 3. 话题标签\n#技术\n## 4. Nano Banana / Google Flow 生图提示词\n主体、构图与留白，比例 16:9。';
+  const d = h.parsePublishReply(raw, 'xiaohongshu', 's:3');
+  assert.equal(d.title, '技术茶园');
+  assert.equal(d.body, '只保留正文。');
+  assert.equal(d.tags, '技术');
+  assert.equal(d.flowPrompt, '主体、构图与留白，比例 16:9。');
+  assert.equal(d.aspectRatio, '16:9');
+});
+
+test('multi-platform response selects only the requested platform block', () => {
+  const h = load('publishHandoff');
+  const raw = '## 小红书\n### 标题\n小红书标题\n### 正文\n小红书正文\n## 公众号\n### 标题\n公众号标题\n### 正文\n公众号正文';
+  const xhs = h.parsePublishReply(raw, 'xiaohongshu', 's:4');
+  const wechat = h.parsePublishReply(raw, 'wechat-oa', 's:4');
+  assert.equal(xhs.title, '小红书标题');
+  assert.equal(xhs.body, '小红书正文');
+  assert.equal(wechat.title, '公众号标题');
+  assert.equal(wechat.body, '公众号正文');
+});
+
+test('an explicit block for another platform is left empty with a warning', () => {
+  const h = load('publishHandoff');
+  const d = h.parsePublishReply('## 小红书\n### 标题\n仅小红书\n### 正文\n不要串到公众号', 'wechat-oa', 's:4b');
+  assert.equal(d.title, '');
+  assert.equal(d.body, '');
+  assert.ok(d.parseWarnings.some(w => w.includes('没有当前平台')));
+});
+
+test('unknown prompt block is flagged and never silently appended to publish body', () => {
+  const h = load('publishHandoff');
+  const d = h.parsePublishReply('## 正文\n安全正文\n## Midjourney 提示词\n不要进入正文', 'xiaohongshu', 's:5');
+  assert.equal(d.body, '安全正文');
+  assert.ok(d.parseWarnings.some(w => w.includes('提示词')));
+});
+
+test('local media references decode once and remain protected', () => {
+  const h = load('publishHandoff');
+  const d = h.parsePublishReply('![封面](outputs/茶园/封面%201.png)\n![Win](C:\\Easel\\outputs\\茶园\\封面%202.png)\n![拒绝](outputs/../secret.png)\n![私有](outputs/_inbox/a.png)', 'xiaohongshu', 's:6');
+  assert.deepEqual(Array.from(d.media), ['茶园/封面 1.png', '茶园/封面 2.png']);
+});
 test('legacy draft migrates; cancel is nonmutating; save-new preserves previous; stale writes rejected', () => {
   const s = load('store', { easel_publish_draft: JSON.stringify({ title:'旧稿', body:'原文', tags:'茶', platforms:['wechat-oa'] }) });
   const old = s.loadPublishDraft();

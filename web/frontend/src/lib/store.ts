@@ -38,6 +38,7 @@ export interface PublishDraft {
   flowPrompt?: string;
   aspectRatio?: string;
   media?: string[];
+  parseWarnings?: string[];
   title: string;
   body: string;
   platforms: string[];

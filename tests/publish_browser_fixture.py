@@ -23,6 +23,7 @@ web.ENV_FILE = STATE / 'nonexistent.env'
 app = FastAPI()
 events = []
 network = []
+policy_mode = 'manual'
 allowed = {'/api/publish-draft/images', '/api/manual-publish/{platform}/export', '/api/media/{path:path}', '/api/outputs'}
 for route in web.app.routes:
     if getattr(route, 'path', '') in allowed:
@@ -37,7 +38,22 @@ async def record(request, next_call):
 
 @app.get('/api/publishing-policy')
 def policy():
-    return {'mode': 'manual', 'automaticSubmission': False}
+    return {'mode': policy_mode, 'automaticSubmission': policy_mode == 'automated'}
+
+
+@app.post('/fixture/policy/{mode}')
+def set_policy(mode: str):
+    global policy_mode
+    if mode not in {'manual', 'automated'}:
+        return JSONResponse({'detail': 'invalid fixture mode'}, status_code=400)
+    policy_mode = mode
+    return {'ok': True, 'mode': mode}
+
+
+@app.get('/fixture/assertions')
+def assertions():
+    forbidden = [entry for entry in network if entry.startswith('POST /api/publish/') or entry == 'POST /api/chat']
+    return {'ok': not forbidden, 'forbidden': forbidden}
 
 
 @app.post('/evidence')

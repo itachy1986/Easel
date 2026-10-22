@@ -18,7 +18,10 @@ export default function PublishHandoff({ text, sourceId, onClose, onImported }: 
     <h2 id="handoff-title">发送到发布中心</h2>
     <p className="pv-hint">核对可见回复，字段不明确时留空。这里仅保存草稿。</p>
     <label className="field-label" htmlFor="handoff-platform">目标平台</label>
-    <select id="handoff-platform" className="field" value={draft.platforms[0]} onChange={e => setDraft({ ...draft, platforms: [e.target.value] })}>
+    <select id="handoff-platform" className="field" value={draft.platforms[0]} onChange={e => {
+      const reparsed = parsePublishReply(text, e.target.value, sourceId);
+      setDraft({ ...reparsed, id: draft.id });
+    }}>
       <option value="xiaohongshu">小红书</option><option value="wechat-oa">公众号</option>
     </select>
     <label className="field-label" htmlFor="handoff-name">标题</label>
@@ -28,6 +31,7 @@ export default function PublishHandoff({ text, sourceId, onClose, onImported }: 
     <label className="field-label" htmlFor="handoff-tags">话题标签</label>
     <input id="handoff-tags" className="field" value={draft.tags} onChange={e => setDraft({ ...draft, tags: e.target.value })} />
     <p className="pv-hint">{draft.flowPrompt ? '独立 Flow 提示词将随草稿保存，可在发布中心编辑。' : '尚无 Flow 提示词，可在发布中心填写。'}</p>
+    {draft.parseWarnings?.map(warning => <p key={warning} role="alert">{warning}</p>)}
     <details><summary>核对回复原文</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{text}</pre></details>
     {existing && <p role="status">已有未完成草稿：可保留旧稿另存，或明确覆盖当前草稿。</p>}
     {error && <p role="alert">{error}</p>}

@@ -26,8 +26,17 @@ function setup() {
     resolve:()=>resolve(['draft-media/a/image.png']),fail:()=>reject(new Error('failed')),
     switch:()=>{current='b';},unmount:()=>cleanup.forEach(fn=>fn?.()),
     cancel:()=>nodes(render()).find(n=>n.type==='button'&&n.props.children==='取消上传').props.onClick(),
-    aborted:()=>signal.aborted,writes:()=>writes};
+    aborted:()=>signal.aborted,writes:()=>writes,render,nodes};
 }
 test('image return attaches to same draft and preserves edits',async()=>{const h=setup();h.start();h.resolve();await settle();assert.equal(h.writes(),1);assert.equal(h.props.draft.body,'保留文案');assert.equal(h.props.draft.tags,'茶');});
 for(const action of ['switch','cancel','unmount'])test(`late image after ${action} never mutates a draft`,async()=>{const h=setup();h.start();h[action]();h.resolve();await settle();assert.equal(h.writes(),0);if(action!=='switch')assert.equal(h.aborted(),true);});
 test('failed upload leaves current draft unchanged',async()=>{const h=setup();h.start();h.fail();await settle();assert.equal(h.writes(),0);assert.deepEqual(h.props.draft.media,[]);});
+test('selected image is immediately rendered and a decode failure gives an actionable error',()=>{
+  const h=setup(); h.props.draft.media=['draft-media/a/image.png'];
+  let tree=h.render();
+  const image=h.nodes(tree).find(n=>n.type==='img'&&n.props['data-draft-media']);
+  assert.ok(image); assert.equal(image.props.src,'draft-media/a/image.png');
+  image.props.onError();
+  tree=h.render();
+  assert.ok(h.nodes(tree).some(n=>n.props?.role==='alert'&&String(n.props.children).includes('重新上传')));
+});

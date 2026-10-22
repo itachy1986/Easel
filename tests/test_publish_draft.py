@@ -12,6 +12,9 @@ def test_social_prompt_only_for_explicit_creation():
     assert 'Nano Banana' not in chat_turn_message('小红书为什么登录失败？', None)
     assert 'Nano Banana' not in chat_turn_message('修复公众号发布按钮 bug', None)
     assert 'Nano Banana' not in chat_turn_message('今天天气怎么样', None)
+    assert 'Nano Banana' in chat_turn_message('写一篇关于用 AI 修复代码的小红书笔记', None)
+    assert 'Nano Banana' in chat_turn_message('给公众号写一篇介绍 API 接口设计的文章', None)
+    assert 'Nano Banana' not in chat_turn_message('排查公众号发布接口报错', None)
 
 
 @pytest.fixture

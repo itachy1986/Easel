@@ -15,6 +15,8 @@
       await wait(()=>document.querySelector('#flow-prompt'));
       assert(draft().flowPrompt.includes('晨光') && !draft().body.includes('INTERNAL'), 'visible text only');
       assert(document.querySelector('a[href="https://labs.google/fx/tools/flow"]'), 'Flow link');
+      (await wait(()=>button('复制 Flow 提示词'))).click();
+      await wait(()=>document.body.textContent.includes('提示词已复制'));
       await report('chat-to-draft', true, 'title/body/tags/Flow separate; manual policy; original retained');
       const canvas=document.createElement('canvas'); canvas.width=24; canvas.height=32; canvas.getContext('2d').fillRect(0,0,24,32);
       const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
@@ -22,22 +24,33 @@
       const input=document.querySelector('#flow-upload'); input.files=transfer.files; input.dispatchEvent(new Event('change',{bubbles:true}));
       await wait(()=>draft().media?.length===1);
       assert(draft().body==='在茶园散步。' && draft().tags==='春天,茶园', 'upload preserves text');
-      await report('image-upload', true, draft().media[0]);
+      await wait(()=>[...document.querySelectorAll('img[data-draft-media]')].some(i=>i.complete&&i.naturalWidth>0));
+      await report('image-upload', true, 'selected image decoded immediately: '+draft().media[0]);
       sessionStorage.setItem('smoke-stage','refresh'); location.reload(); return;
     }
     (await wait(()=>button('工作台'))).click();
     (await wait(()=>button('发布中心') || [...document.querySelectorAll('button')].find(b=>b.textContent.includes('发布中心')))).click();
     await wait(()=>document.querySelector('#flow-upload'));
     assert(draft().media.length===1 && draft().flowPrompt.includes('晨光'), 'refresh persisted');
-    await wait(()=>[...document.images].some(i=>i.src.includes('draft-media') && i.complete && i.naturalWidth>0));
+    await wait(()=>[...document.querySelectorAll('img[data-draft-media]')].some(i=>i.complete&&i.naturalWidth>0));
     await report('refresh-preview',true,'real image decoded; text/Flow/media persisted');
-    const checks=[...document.querySelectorAll('input[type="checkbox"]')];
-    const review=checks.find(c=>c.parentElement.textContent.includes('审核'));
+    const review=document.querySelector('input[aria-label="小红书人工审核"]');
     assert(review,'review gate found'); review.click();
     const exportButton=await wait(()=>[...document.querySelectorAll('button')].find(b=>b.textContent.includes('导出')&&!b.disabled));
     exportButton.click();
     await wait(()=>document.body.textContent.includes('已生成稿件包'));
     await report('manual-export',true,'reviewed package created, no social publish/model calls');
+    await fetch('/fixture/policy/automated',{method:'POST'});
+    sessionStorage.setItem('smoke-stage','automated'); location.reload(); return;
+  } catch(error) { await report('failure',false,String(error)); }
+  try {
+    if (sessionStorage.getItem('smoke-stage') !== 'automated') return;
+    (await wait(()=>button('工作台'))).click();
+    (await wait(()=>button('发布中心') || [...document.querySelectorAll('button')].find(b=>b.textContent.includes('发布中心')))).click();
+    await wait(()=>document.querySelector('#flow-upload'));
+    await wait(()=>[...document.querySelectorAll('img[data-draft-media]')].some(i=>i.complete&&i.naturalWidth>0));
+    const boundary=await (await fetch('/fixture/assertions')).json(); assert(boundary.ok,'forbidden network call: '+boundary.forbidden);
+    await report('automatic-preview',true,'same persisted draft image decoded; no model or publishing POST');
     const banner=document.createElement('p'); banner.textContent='ISOLATED BROWSER SMOKE PASS — chat → draft → image → refresh → preview → export'; banner.style='position:fixed;bottom:0;left:0;background:#165c35;color:white;padding:16px;z-index:99999';document.body.append(banner);
     sessionStorage.setItem('smoke-stage','done');
   } catch(error) { await report('failure',false,String(error)); }

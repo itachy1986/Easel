@@ -11,6 +11,7 @@ export default function FlowDraftPanel({ draft, onPrompt, onRatio, onMedia, onPi
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [missing, setMissing] = useState<string[]>([]);
+  const [broken, setBroken] = useState<string[]>([]);
   const upload = useRef<AbortController | null>(null);
   useEffect(() => () => upload.current?.abort(), []);
   useEffect(() => {
@@ -24,6 +25,7 @@ export default function FlowDraftPanel({ draft, onPrompt, onRatio, onMedia, onPi
     })).then(paths => { if (active) setMissing(paths.filter(Boolean)); });
     return () => { active = false; };
   }, [draft.media]);
+  useEffect(() => setBroken(old => old.filter(path => draft.media?.includes(path))), [draft.media]);
   const receive = async (files: File[]) => {
     if (!files.length || busy || !draft.id) return;
     const id = draft.id;
@@ -55,6 +57,15 @@ export default function FlowDraftPanel({ draft, onPrompt, onRatio, onMedia, onPi
     <input id="flow-upload" type="file" accept="image/png,image/jpeg,image/webp" multiple disabled={busy} onChange={e => { void receive(Array.from(e.target.files || [])); e.target.value = ''; }} />
     <button className="btn btn-sm" onClick={onPick}>从内容库选择</button>
     {busy && <button className="btn btn-sm" onClick={() => { upload.current?.abort(); setBusy(false); setNotice('已取消回填，草稿未更改。'); }}>取消上传</button>}
+    {!!draft.media?.length && <div className="media-grid" aria-label="当前草稿素材预览">
+      {draft.media.map(path => /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i.test(path)
+        ? <div className="media-cell sel" key={path}>
+          <img data-draft-media src={mediaUrl(path)} alt={`当前草稿图片 ${path.split('/').pop() || ''}`}
+            onError={() => setBroken(old => old.includes(path) ? old : [...old, path])} />
+        </div>
+        : <div className="media-cell sel" key={path}><span className="media-vid">视频 · {path.split('/').pop()}</span></div>)}
+    </div>}
+    {broken.length > 0 && <p role="alert">部分图片无法解码显示，请移除后重新上传 PNG/JPEG/WebP，或从内容库重新选择。</p>}
     <p role="status">{missing.length ? '部分素材已失效，请移除后重新上传或从内容库选择。' : !draft.media?.length ? '缺少图片/视频：请上传生成图片或从内容库选择。' : '已具备图片/视频，请核对预览后再审核。'}</p>
     {notice && <p role="status">{notice}</p>}
     {draft.originalResponse && <details><summary>核对聊天原文</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{draft.originalResponse}</pre></details>}
