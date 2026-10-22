@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSchedule, executeSkill, exportManualPackage, fetchOutputs, mediaUrl, runAgent, streamChat } from '../lib/api';
 import type { OutputFile } from '../lib/api';
-import { loadPublishDraft, savePublishDraft } from '../lib/store';
+import { usePublishDraft } from '../lib/usePublishDraft';
+import FlowDraftPanel from './FlowDraftPanel';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconCalendar, IconCheck, IconCopy, IconEdit, IconPublish, IconSkills, IconStop, IconTrash } from './icons';
 
@@ -26,14 +27,13 @@ function today() {
 }
 
 export default function ManualPublishPage({ persona }: { persona: string }) {
-  const initial = useRef(loadPublishDraft()).current;
-  const [title, setTitle] = useState(initial.title);
-  const [body, setBody] = useState(initial.body);
-  const [platforms, setPlatforms] = useState<string[]>(initial.platforms);
-  const [overrides, setOverrides] = useState<Record<string, string>>(initial.overrides);
-  const [tags, setTags] = useState(initial.tags || '');
+  const { draft, field, saveError } = usePublishDraft();
+  const { title, body, platforms, overrides, tags } = draft;
+  const setTitle = field('title'), setBody = field('body'), setPlatforms = field('platforms');
+  const setOverrides = field('overrides'), setTags = field('tags');
   const [mediaFiles, setMediaFiles] = useState<OutputFile[]>([]);
-  const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
+  const selectedMedia = draft.media || [];
+  const setSelectedMedia = (update: (old: string[]) => string[]) => field('media')(old => update(old || []));
   const [showPicker, setShowPicker] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [reviewed, setReviewed] = useState<Record<string, string>>({});
@@ -48,7 +48,6 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
   const [saving, setSaving] = useState(false);
   const ctl = useRef<AbortController | null>(null);
 
-  useEffect(() => { savePublishDraft({ title, body, platforms, overrides, tags }); }, [title, body, platforms, overrides, tags]);
   useEffect(() => () => ctl.current?.abort(), []);
   useEffect(() => {
     fetchOutputs().then((roots) => {
@@ -171,6 +170,9 @@ export default function ManualPublishPage({ persona }: { persona: string }) {
   return <div className="publish-page">
     <div className="publish-editor">
       <h1 className="page-title"><IconPublish size={21} /> 发布中心 · 人工发布</h1>
+      {saveError && <p role="alert">{saveError}</p>}
+      <FlowDraftPanel draft={draft} onPrompt={field('flowPrompt')} onRatio={field('aspectRatio')}
+        onMedia={setSelectedMedia} onPick={() => setShowPicker(true)} />
       <p className="page-subtitle">AI 排版 → 人工审核 → 复制 / 导出 → 在官方发布页亲自提交。</p>
       <div className="panel" style={{ marginBottom: 16, fontSize: 13 }}>
         <strong>最终提交由你完成。</strong> 本页不自动登录、上传或点击发布。官方页面的登录与 Easel 账号页相互独立。

@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
+import { test } from 'node:test';
+const require = createRequire(new URL('../../web/frontend/package.json', import.meta.url));
+const ts = require('typescript');
+function load(file, initial = {}) {
+  const source = readFileSync(new URL(`../../web/frontend/src/lib/${file}.ts`, import.meta.url), 'utf8');
+  const entries = new Map(Object.entries(initial));
+  const localStorage = { getItem: k => entries.get(k) ?? null, setItem: (k,v) => entries.set(k,v), removeItem: k => entries.delete(k) };
+  const exports = {};
+  runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
+    { exports, localStorage, Date, Math });
+  return { ...exports, entries };
+}
+test('visible structured response separates Flow prompt and retains original without inventing fields', () => {
+  const h = load('publishHandoff');
+  const raw = '## 标题\n春日茶园\n## 发布正文\n在茶园散步。\n\n享受春天。\n## 话题标签\n#春天 #茶园\n## Nano Banana 生图提示词\n茶园主体，晨光，绿色，竖版留白。';
+  const d = h.parsePublishReply(raw, 'xiaohongshu', 's:1');
+  assert.equal(d.title, '春日茶园');
+  assert.equal(d.body, '在茶园散步。\n\n享受春天。');
+  assert.equal(d.tags, '春天,茶园');
+  assert.equal(d.flowPrompt, '茶园主体，晨光，绿色，竖版留白。');
+  assert.equal(d.originalResponse, raw);
+  assert.equal(d.aspectRatio, '3:4');
+  assert.equal(h.parsePublishReply('普通回复', 'wechat-oa', 's:2').title, '');
+  assert.equal(h.parsePublishReply('普通回复', 'wechat-oa', 's:2').tags, '');
+});
+test('legacy draft migrates; cancel is nonmutating; save-new preserves previous; stale writes rejected', () => {
+  const s = load('store', { easel_publish_draft: JSON.stringify({ title:'旧稿', body:'原文', tags:'茶', platforms:['wechat-oa'] }) });
+  const old = s.loadPublishDraft();
+  const candidate = { ...old, id:'new', title:'新稿', sourceId:'s:1', flowPrompt:'茶园', media:['draft-media/a/cover.png'] };
+  const before = s.entries.get('easel_publish_draft');
+  s.importPublishDraft(candidate, 'cancel');
+  assert.equal(s.entries.get('easel_publish_draft'), before);
+  s.importPublishDraft(candidate, 'new');
+  assert.equal(s.loadPublishDraft().title, '新稿');
+  assert.equal(s.listPublishDrafts().find(d => d.id === old.id).body, '原文');
+  assert.equal(s.savePublishDraft({...old, title:'迟到的异步写入'}), false);
+  assert.equal(s.loadPublishDraft().title, '新稿');
+  assert.equal(s.loadPublishDraft().media[0], 'draft-media/a/cover.png');
+  assert.equal(s.loadPublishDraft().flowPrompt, '茶园');
+  s.selectPublishDraft(old.id);
+  assert.equal(s.loadPublishDraft().body, '原文');
+});

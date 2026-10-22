@@ -4,7 +4,8 @@ import {
   fetchAccounts, publishNow, publishStatus, submitPublishSms, fetchOutputs, mediaUrl,
 } from '../lib/api';
 import type { AccountItem, OutputFile } from '../lib/api';
-import { loadPublishDraft, savePublishDraft } from '../lib/store';
+import { usePublishDraft } from '../lib/usePublishDraft';
+import FlowDraftPanel from './FlowDraftPanel';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconPublish, IconCopy, IconCheck, IconCalendar, IconSkills, IconEdit, IconStop, IconTrash } from './icons';
 
@@ -42,12 +43,10 @@ function parseSections(text: string): Record<string, string> {
 type PubState = { status: 'publishing' | 'ok' | 'fail'; msg: string };
 
 export default function PublishPage({ persona }: PublishPageProps) {
-  const draft0 = loadPublishDraft();
-  const [title, setTitle] = useState(draft0.title);
-  const [body, setBody] = useState(draft0.body);
-  const [platforms, setPlatforms] = useState<string[]>(draft0.platforms);
-  const [overrides, setOverrides] = useState<Record<string, string>>(draft0.overrides);
-  const [tags, setTags] = useState(draft0.tags || '');
+  const { draft, field, saveError } = usePublishDraft();
+  const { title, body, platforms, overrides, tags } = draft;
+  const setTitle = field('title'), setBody = field('body'), setPlatforms = field('platforms');
+  const setOverrides = field('overrides'), setTags = field('tags');
   const [editing, setEditing] = useState<string | null>(null);
   const [copied, setCopied] = useState('');
   const [toast, setToast] = useState('');
@@ -62,7 +61,8 @@ export default function PublishPage({ persona }: PublishPageProps) {
   // 发布相关
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [mediaFiles, setMediaFiles] = useState<OutputFile[]>([]);
-  const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
+  const selectedMedia = draft.media || [];
+  const setSelectedMedia = (update: (old: string[]) => string[]) => field('media')(old => update(old || []));
   const [showPicker, setShowPicker] = useState(false);
   const [pub, setPub] = useState<Record<string, PubState>>({});
   const [publishing, setPublishing] = useState(false);
@@ -71,10 +71,6 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const [pubSmsCode, setPubSmsCode] = useState('');
   const [pubSmsBusy, setPubSmsBusy] = useState(false);
 
-  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在
-  useEffect(() => {
-    savePublishDraft({ title, body, platforms, overrides, tags });
-  }, [title, body, platforms, overrides, tags]);
 
   const cleanupPublishActivity = useCallback(() => {
     // 卸载：中止流 + 停掉所有发布状态轮询（否则在后台空转最长 15 分钟）
@@ -314,6 +310,9 @@ export default function PublishPage({ persona }: PublishPageProps) {
     <div className="publish-page">
       <div className="publish-editor">
         <h1 className="page-title"><IconPublish size={21} /> 发布中心</h1>
+        {saveError && <p role="alert">{saveError}</p>}
+        <FlowDraftPanel draft={draft} onPrompt={field('flowPrompt')} onRatio={field('aspectRatio')}
+          onMedia={setSelectedMedia} onPick={() => setShowPicker(true)} />
         <p className="page-subtitle">一次编辑 → AI 一键改写成各平台版本 → 预检 → 附媒体 → 一键真发布。</p>
 
         <label className="field-label">标题</label>

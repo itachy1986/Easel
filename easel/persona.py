@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from easel.social_draft import social_draft_instruction
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILES_DIR = PROJECT_ROOT / "profiles"
@@ -109,4 +110,5 @@ def chat_turn_message(user_message: str, name: str | None) -> str:
     """
     prefix = persona_prefix(name)
     head = f"{prefix}\n\n" if prefix else ""
-    return f"{head}{user_message}\n\n{turn_reminder()}"
+    guidance = social_draft_instruction(user_message)
+    return f"{head}{user_message}\n\n{turn_reminder()}" + (f"\n\n{guidance}" if guidance else "")

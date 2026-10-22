@@ -31,6 +31,13 @@ export interface StreamState {
 
 /** 发布中心草稿：持久化到 localStorage，切页/刷新都不丢。 */
 export interface PublishDraft {
+  version?: number;
+  id?: string;
+  sourceId?: string;
+  originalResponse?: string;
+  flowPrompt?: string;
+  aspectRatio?: string;
+  media?: string[];
   title: string;
   body: string;
   platforms: string[];
@@ -38,6 +45,7 @@ export interface PublishDraft {
   tags: string;   // 话题标签，逗号分隔（小红书绑话题；其它平台按需写入）
 }
 const PUBLISH_KEY = 'easel_publish_draft';
+const PUBLISH_SAVED_KEY = 'easel_publish_saved_drafts';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
 
 function readMigratedLocalValue(key: string, suffix: string): string | null {
@@ -58,14 +66,47 @@ const PUBLISH_DEFAULT: PublishDraft = {
 export function loadPublishDraft(): PublishDraft {
   try {
     const raw = readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
-    if (!raw) return { ...PUBLISH_DEFAULT };
-    return { ...PUBLISH_DEFAULT, ...(JSON.parse(raw) as PublishDraft) };
+    const parsed = raw ? JSON.parse(raw) : {};
+    const draft = { ...PUBLISH_DEFAULT, ...parsed, version: 2,
+      id: typeof parsed.id === 'string' ? parsed.id : generateId(),
+      media: Array.isArray(parsed.media) ? parsed.media.filter((p: unknown) => typeof p === 'string') : [],
+      flowPrompt: typeof parsed.flowPrompt === 'string' ? parsed.flowPrompt : '',
+      aspectRatio: typeof parsed.aspectRatio === 'string' ? parsed.aspectRatio : '3:4',
+    };
+    if (!parsed.id) localStorage.setItem(PUBLISH_KEY, JSON.stringify(draft));
+    return draft;
   } catch {
     return { ...PUBLISH_DEFAULT };
   }
 }
-export function savePublishDraft(d: PublishDraft): void {
-  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(d)); } catch { /* quota */ }
+export function savePublishDraft(d: PublishDraft): boolean {
+  const current = loadPublishDraft();
+  if (d.id && current.id !== d.id) return false;
+  localStorage.setItem(PUBLISH_KEY, JSON.stringify({ ...current, ...d, version: 2 }));
+  return true;
+}
+
+export function listPublishDrafts(): PublishDraft[] {
+  const current = loadPublishDraft();
+  const raw = localStorage.getItem(PUBLISH_SAVED_KEY);
+  const saved: PublishDraft[] = raw ? JSON.parse(raw) : [];
+  return [current, ...saved.filter(d => d.id !== current.id)];
+}
+
+export function hasPublishContent(d: PublishDraft): boolean {
+  return Boolean(d.title || d.body || d.tags || d.flowPrompt || d.media?.length || Object.values(d.overrides).some(Boolean));
+}
+
+/** Save the old draft first. A quota failure never discards the active draft. */
+export function importPublishDraft(d: PublishDraft, choice: 'new' | 'replace' | 'cancel'): void {
+  if (choice === 'cancel') return;
+  if (choice === 'new') localStorage.setItem(PUBLISH_SAVED_KEY, JSON.stringify(listPublishDrafts()));
+  localStorage.setItem(PUBLISH_KEY, JSON.stringify({ ...d, version: 2, id: d.id || generateId() }));
+}
+
+export function selectPublishDraft(id: string): void {
+  const draft = listPublishDrafts().find(d => d.id === id);
+  if (draft) importPublishDraft(draft, 'new');
 }
 
 const STORAGE_KEY = 'easel_sessions';

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import MessageBubble from './MessageBubble';
+import PublishHandoff from './PublishHandoff';
 import QuestionCards from './QuestionCards';
 import BrushEntry from './BrushEntry';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
@@ -8,6 +9,7 @@ import type { UploadedFile } from '../lib/api';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 
 interface ChatPageProps {
+  onPublishNavigate?: () => void;
   apiDirect: boolean;
   session: ChatSession;
   stream?: StreamState;          // 进行中的流式态（来自 App，切页也不丢）
@@ -36,7 +38,8 @@ function greeting(): string {
   return `${g}，想创作点什么？`;
 }
 
-export default function ChatPage({ apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered }: ChatPageProps) {
+export default function ChatPage({ apiDirect, session, stream, onSend, onStop, onResend, onQuestionAnswered, onPublishNavigate }: ChatPageProps) {
+  const [handoff, setHandoff] = useState<{ text: string; sourceId: string } | null>(null);
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -211,6 +214,9 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
 
   return (
     <div className="chat-page">
+      {handoff && <PublishHandoff {...handoff} onClose={() => setHandoff(null)} onImported={() => {
+        setHandoff(null); onPublishNavigate?.();
+      }} />}
       <div className="chat-messages">
         <div className="chat-thread">
           {displayMessages.map((msg, i) => {
@@ -234,6 +240,7 @@ export default function ChatPage({ apiDirect, session, stream, onSend, onStop, o
                 const pi = i - 1;
                 const prevUser = pi >= 0 && session.messages[pi]?.role === 'user' ? session.messages[pi] : null;
                 actions = {
+                  onPublish: msg.content.trim() ? () => setHandoff({ text: msg.content, sourceId: `${session.id}:${i}` }) : undefined,
                   onCopy: copy,
                   onRetry: (isLastFinal && prevUser)
                     ? () => onResend(pi, prevUser.content, prevUser.attachments, prevUser.agentContent)

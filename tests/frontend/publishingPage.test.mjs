@@ -27,7 +27,7 @@ function setup(responses = [automaticPolicy]) {
     react: {
       useState(initial) {
         const index = cursor++;
-        if (!(index in state)) state[index] = initial;
+        if (!(index in state)) state[index] = typeof initial === 'function' ? initial() : initial;
         return [state[index], value => {
           state[index] = typeof value === 'function' ? value(state[index]) : value;
         }];
@@ -44,6 +44,11 @@ function setup(responses = [automaticPolicy]) {
       },
     },
     'react/jsx-runtime': { jsx: createElement, jsxs: createElement },
+    '../lib/store': {
+      loadPublishDraft: () => ({ id: 'test-draft', title: '固定测试稿' }),
+      listPublishDrafts: () => [{ id: 'test-draft', title: '固定测试稿' }],
+      selectPublishDraft: () => {},
+    },
     '../lib/api': {
       fetchPublishingPolicy() {
         const response = responses[requests++];

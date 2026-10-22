@@ -334,6 +334,14 @@ export function deleteOutput(path: string): Promise<{ ok: boolean; deleted: stri
 
 export interface UploadedFile { id: string; name: string; path: string; }
 
+export async function importDraftImages(files: File[], draftId: string, signal: AbortSignal): Promise<string[]> {
+  const form = new FormData();
+  form.append('draftId', draftId);
+  files.forEach(file => form.append('files', file));
+  const result = await request<{ media: string[] }>('/api/publish-draft/images', { method: 'POST', body: form, signal });
+  return result.media;
+}
+
 /** OpenClaw ask_user 问答题（SSE question 事件 payload）。 */
 export interface ChatQuestionOption { label: string; description?: string; }
 export interface ChatQuestionItem {
