@@ -5,6 +5,7 @@ Open http://127.0.0.1:8765 in the approved built-in browser. Evidence: /evidence
 Only synthetic fixtures in this checkout's .smoke-issue38 directory are used.
 """
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from web import app as web
 
 ROOT = Path(__file__).resolve().parents[1]
-if not (ROOT / '.git').is_file():
+is_isolated_worktree = (ROOT / '.git').is_file()
+is_github_actions_runner = os.environ.get('GITHUB_ACTIONS') == 'true'
+if not (is_isolated_worktree or is_github_actions_runner):
     raise RuntimeError('Run this fixture only inside an isolated Git worktree, never the formal checkout')
 STATE = ROOT / '.smoke-issue38'
 STATE.mkdir(exist_ok=True)
