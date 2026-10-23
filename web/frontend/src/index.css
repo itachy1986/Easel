@@ -33,6 +33,11 @@
   background: #2855b7;
   color: #fff;
 }
+/* Beat theme.css's (0,4,0) :is() rule in every state, including Tab-only focus. */
+:root[data-theme='dark'] .publish-draft-actions .btn.btn-primary {
+  background: #2855b7;
+  color: #fff;
+}
 .publish-draft-actions .btn:focus-visible, .code-block-actions .btn:focus-visible {
   outline: 3px solid var(--text);
   outline-offset: 3px;
