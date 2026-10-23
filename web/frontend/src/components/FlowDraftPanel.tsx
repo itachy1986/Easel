@@ -45,7 +45,7 @@ export default function FlowDraftPanel({ draft, onPrompt, onRatio, onMedia, onPi
     <input id="flow-ratio" className="field" value={draft.aspectRatio || '3:4'} onChange={e => onRatio(e.target.value)} />
     <label className="field-label" htmlFor="flow-prompt">独立配图提示词</label>
     <textarea id="flow-prompt" className="field" rows={4} value={draft.flowPrompt || ''} onChange={e => onPrompt(e.target.value)} placeholder="请让聊天助手按正文提供主体、场景、构图、光线、风格与留白，或自行填写。" />
-    <div className="msg-actions">
+    <div className="publish-draft-actions">
       <button className="btn btn-sm" disabled={!draft.flowPrompt?.trim()} onClick={async () => {
         try { await navigator.clipboard.writeText(`画面比例：${draft.aspectRatio || '3:4'}\n${draft.flowPrompt}`); setNotice('提示词已复制'); }
         catch { setNotice('复制失败，请选择提示词手动复制。'); }

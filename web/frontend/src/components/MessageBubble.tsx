@@ -5,6 +5,7 @@ import { linkifyOutputs, externalizeMediaLinks } from '../lib/linkifyOutputs';
 import { IconCopy, IconCheck, IconRetry } from './icons';
 import { extractArtifacts } from '../lib/artifacts';
 import ArtifactGallery from './ArtifactGallery';
+import CopyableMarkdown from './CopyableMarkdown';
 
 export interface BubbleActions {
   onPublish?: () => void;
@@ -121,7 +122,7 @@ export default function MessageBubble({ message, isStreaming, thinking, activity
       <div className="msg-col assistant">
         <div className="message-bubble assistant">
           {livePanel}
-          {message.content && <div dangerouslySetInnerHTML={{ __html: rendered.html }} />}
+          {message.content && <CopyableMarkdown html={rendered.html} completed={!isStreaming} />}
           {!isStreaming && (rendered.artifacts.length > 0 || rendered.archives.length > 0) && (
             <ArtifactGallery artifacts={rendered.artifacts} archives={rendered.archives} />
           )}
